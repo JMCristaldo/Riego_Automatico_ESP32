@@ -1,0 +1,15 @@
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Arduino / ESP32
+*.bin
+*.elf
+*.map
+*.hex
+
+# VS Code
+.vscode/
+
+# Temporales
+*.log
