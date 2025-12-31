@@ -1,8 +1,12 @@
 #include <Wire.h>
 //#include <U8g2lib.h>
 #include <WiFi.h>
+#include <time.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
+
+Preferences prefs;
 
 #define PIN_HUMEDAD 32
 #define PIN_BOMBA   18
@@ -16,6 +20,34 @@ volatile int humedadPct = 0;
 volatile int umbralPct  = 50;
 volatile bool modoManual = false;
 volatile bool regando = false;
+
+// ---------- NTP / Hora ----------
+volatile bool ntpOk = false;
+unsigned long lastNtpCheckMs = 0;
+const unsigned long NTP_CHECK_PERIOD_MS = 2000;  // cada 2s
+
+
+// ---------- Config AUTO / Programado (persistente) ----------
+// Auto mode: 0 = AUTO_SENSOR, 1 = AUTO_PROGRAMADO
+volatile int autoMode = 0;
+
+// Programado: días de INICIO (bits 0=Dom .. 6=Sab)
+volatile int diasMask = 0b01111110; // Lun..Vie por defecto
+
+// Ventana: inicio + duración (min)
+volatile int startHour = 7;
+volatile int startMin  = 30;
+volatile int durWindowMin = 60; // 1 hora por defecto
+
+// Programado: 0 = PROG_SENSOR, 1 = PROG_CICLOS
+volatile int progMode = 0;
+
+// Ciclos X/Y (min)
+volatile int cycleEveryMin = 30; // cada X minutos
+volatile int cycleOnMin    = 2;  // riega Y minutos
+
+// Seguridad por sensor en ciclos
+volatile bool sensorLimitEnable = true;
 
 
 // --- Anti-ciclo / histéresis ---
@@ -47,7 +79,152 @@ void setupServer();
 void toggleManual();
 void handleButton();
 void sampleAndControl();
+void loadConfigFromNVS();
+void saveConfigToNVS();
+void initNTP();
+void updateNtpStatus();
+String getLocalTimeString();
+bool isWindowActive();
+int dayStartMinuteIndex(int wday);
 
+
+
+void loadConfigFromNVS() {
+  // Si no existe la key, mantiene el default actual (segundo parámetro)
+  umbralPct = prefs.getInt("umbral", umbralPct);
+
+  autoMode = prefs.getInt("autoMode", autoMode);
+  diasMask = prefs.getInt("diasMask", diasMask);
+
+  startHour = prefs.getInt("stH", startHour);
+  startMin  = prefs.getInt("stM", startMin);
+  durWindowMin = prefs.getInt("durW", durWindowMin);
+
+  progMode = prefs.getInt("progMode", progMode);
+
+  cycleEveryMin = prefs.getInt("cyEvery", cycleEveryMin);
+  cycleOnMin    = prefs.getInt("cyOn", cycleOnMin);
+
+  sensorLimitEnable = prefs.getBool("sensLim", sensorLimitEnable);
+
+  // Sanitizado mínimo (para no cargar basura si alguna vez se guarda mal)
+  if (umbralPct < 0) umbralPct = 0;
+  if (umbralPct > 100) umbralPct = 100;
+
+  if (autoMode < 0) autoMode = 0;
+  if (autoMode > 1) autoMode = 1;
+
+  if (diasMask < 0) diasMask = 0;
+  if (diasMask > 127) diasMask = 127;
+
+  if (startHour < 0) startHour = 0;
+  if (startHour > 23) startHour = 23;
+
+  if (startMin < 0) startMin = 0;
+  if (startMin > 59) startMin = 59;
+
+  if (durWindowMin < 1) durWindowMin = 1;
+  if (durWindowMin > 1440) durWindowMin = 1440;
+
+  if (progMode < 0) progMode = 0;
+  if (progMode > 1) progMode = 1;
+
+  if (cycleEveryMin < 1) cycleEveryMin = 1;
+  if (cycleEveryMin > 1440) cycleEveryMin = 1440;
+
+  if (cycleOnMin < 1) cycleOnMin = 1;
+  if (cycleOnMin > 1440) cycleOnMin = 1440;
+}
+
+void saveConfigToNVS() {
+  prefs.putInt("umbral", umbralPct);
+
+  prefs.putInt("autoMode", autoMode);
+  prefs.putInt("diasMask", diasMask);
+
+  prefs.putInt("stH", startHour);
+  prefs.putInt("stM", startMin);
+  prefs.putInt("durW", durWindowMin);
+
+  prefs.putInt("progMode", progMode);
+
+  prefs.putInt("cyEvery", cycleEveryMin);
+  prefs.putInt("cyOn", cycleOnMin);
+
+  prefs.putBool("sensLim", sensorLimitEnable);
+}
+
+void initNTP() {
+  // Argentina UTC-3 (sin DST)
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+}
+
+void updateNtpStatus() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastNtpCheckMs < NTP_CHECK_PERIOD_MS) return;
+  lastNtpCheckMs = nowMs;
+
+  time_t now = time(nullptr);
+
+  // Si NTP todavía no sincronizó, suele devolver 0 o un valor muy bajo.
+  // Usamos un umbral seguro (2023-11 aprox) para evitar falsos positivos.
+  if (now > 1700000000) {
+    ntpOk = true;
+  } else {
+    ntpOk = false;
+  }
+}
+
+String getLocalTimeString() {
+  if (!ntpOk) return String("--:--:--");
+
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+  return String(buf);
+}
+
+bool isWindowActive() {
+  if (!ntpOk) return false;
+
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+
+  int nowMinOfDay = t.tm_hour * 60 + t.tm_min; // 0..1439
+  int todayWday = t.tm_wday;                   // 0..6
+
+  int startMin = startHour * 60 + startMin;
+  int dur = durWindowMin;
+
+  // Seguridad
+  if (dur <= 0) return false;
+  if (dur > 1440) dur = 1440; // por ahora limitamos a 24h (coherente con el modelo)
+
+  // Caso 1: ventana NO cruza medianoche (start + dur <= 1440)
+  if (startMin + dur <= 1440) {
+    // Activa solo si HOY es un día marcado y estamos dentro
+    if ((diasMask & (1 << todayWday)) == 0) return false;
+    return (nowMinOfDay >= startMin) && (nowMinOfDay < (startMin + dur));
+  }
+
+  // Caso 2: ventana cruza medianoche (ej 20:00 + 600min => termina al día siguiente)
+  int endMinNextDay = (startMin + dur) - 1440; // fin en el día siguiente (0..)
+
+  // a) Si estamos en el tramo "antes de medianoche": hoy debe estar marcado
+  if (nowMinOfDay >= startMin) {
+    if ((diasMask & (1 << todayWday)) == 0) return false;
+    return true;
+  }
+
+  // b) Si estamos en el tramo "después de medianoche": debe haber arrancado AYER (marcado)
+  int ydayWday = (todayWday + 6) % 7; // ayer
+  if ((diasMask & (1 << ydayWday)) == 0) return false;
+  return (nowMinOfDay < endMinNextDay);
+}
 
 void setupServer() {
   Serial.println("[setupServer] Entrando...");
@@ -64,6 +241,8 @@ void setupServer() {
   Serial.println("\nWiFi conectado");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
+  initNTP();
+  Serial.println("NTP iniciado.");
 
   // Ruta principal
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -248,7 +427,28 @@ void setupServer() {
     request->send(200, "text/plain", "OK");
   });
 
-  
+  server.on("/time/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{";
+    json += "\"ntpOk\":" + String(ntpOk ? "true" : "false") + ",";
+    json += "\"time\":\"" + getLocalTimeString() + "\"";
+    json += "}";
+
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/window/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{";
+    json += "\"ntpOk\":" + String(ntpOk ? "true" : "false") + ",";
+    json += "\"active\":" + String(isWindowActive() ? "true" : "false") + ",";
+    json += "\"diasMask\":" + String(diasMask) + ",";
+    json += "\"start\":\"" + String(startHour) + ":" + (startMin < 10 ? "0" : "") + String(startMin) + "\",";
+    json += "\"durMin\":" + String(durWindowMin) + ",";
+    json += "\"time\":\"" + getLocalTimeString() + "\"";
+    json += "}";
+
+    request->send(200, "application/json", json);
+  });
+
 
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
   String json = "{";
@@ -283,6 +483,8 @@ void setupServer() {
     if (val > 100) val = 100;
 
     umbralPct = val;
+    saveConfigToNVS();
+
     request->send(200, "text/plain", "OK");
   });
 
@@ -304,6 +506,10 @@ void setup() {
 
   pinMode(PIN_BOMBA, OUTPUT);
   digitalWrite(PIN_BOMBA, LOW);
+  prefs.begin("riego", false);
+  loadConfigFromNVS();
+  Serial.print("Umbral cargado: ");
+  Serial.println(umbralPct);
 
   pinMode(PIN_BTN, INPUT_PULLUP);
 
@@ -414,6 +620,8 @@ void sampleAndControl() {
 
 void loop() {
   handleButton();
+
+  updateNtpStatus();
 
   unsigned long now = millis();
 
