@@ -12,8 +12,6 @@ Preferences prefs;
 #define PIN_BOMBA   18
 #define PIN_BTN     15
 
-// OLED SSD1306 128x64 I2C (dirección detectada: 0x3C)
-//U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
 // ---------- Estado del sistema ----------
 volatile int humedadPct = 0;
@@ -21,6 +19,15 @@ volatile int umbralPct  = 50;
 volatile bool modoManual = false;
 volatile bool regando = false;
 volatile int diasMask = 127;
+
+enum CycleState {
+  CYCLE_IDLE,   // esperando próximo ciclo
+  CYCLE_ON,    // regando Y minutos
+  CYCLE_OFF    // esperando X minutos
+};
+volatile CycleState cycleState = CYCLE_IDLE;
+unsigned long cycleStateMs = 0;   // marca de tiempo del último cambio
+
 
 // ---------- NTP / Hora ----------
 volatile bool ntpOk = false;
@@ -818,77 +825,155 @@ void handleButton() {
 
 void sampleAndControl() {
   humedadPct = map(analogRead(PIN_HUMEDAD), 0, 4095, 0, 100);
+ 
 
- if (!modoManual) {
+  if (!modoManual) {
 
-  // 1) AUTO_SENSOR (como hoy)
-  if (autoMode == 0) {
-    bool desired = regando;
+    // 1) AUTO_SENSOR (como hoy)
+    if (autoMode == 0) {
+      bool desired = regando;
 
-    if (regando) {
-      if (humedadPct > (umbralPct + H)) desired = false;
-    } else {
-      if (humedadPct < (umbralPct - H)) desired = true;
-    }
-
-    unsigned long now = millis();
-    if (desired != regando) {
       if (regando) {
-        if (now - lastPumpChangeMs >= MIN_ON_MS) {
-          regando = desired;
-          lastPumpChangeMs = now;
-        }
+        if (humedadPct > (umbralPct + H)) desired = false;
       } else {
-        if (now - lastPumpChangeMs >= MIN_OFF_MS) {
-          regando = desired;
-          lastPumpChangeMs = now;
-        }
+        if (humedadPct < (umbralPct - H)) desired = true;
       }
-    }
-  }
 
-  // 2) AUTO_PROGRAMADO (por ahora solo "habilita o no habilita" la posibilidad de regar)
-  else {
-    // Si NO estamos en ventana, apagamos y listo
-    if (!isWindowActive()) {
-      if (regando) {
-        regando = false;
-        lastPumpChangeMs = millis();
-      }
-    } else {
-      // Estamos en ventana:
-      // Por ahora solo implementamos PROG_SENSOR (progMode==0) usando la misma lógica que AUTO_SENSOR.
-      // PROG_CICLOS lo hacemos en Paso 5.
-      if (progMode == 0) {
-        bool desired = regando;
-
+      unsigned long now = millis();
+      if (desired != regando) {
         if (regando) {
-          if (humedadPct > (umbralPct + H)) desired = false;
+          if (now - lastPumpChangeMs >= MIN_ON_MS) {
+            regando = desired;
+            lastPumpChangeMs = now;
+          }
         } else {
-          if (humedadPct < (umbralPct - H)) desired = true;
-        }
-
-        unsigned long now = millis();
-        if (desired != regando) {
-          if (regando) {
-            if (now - lastPumpChangeMs >= MIN_ON_MS) {
-              regando = desired;
-              lastPumpChangeMs = now;
-            }
-          } else {
-            if (now - lastPumpChangeMs >= MIN_OFF_MS) {
-              regando = desired;
-              lastPumpChangeMs = now;
-            }
+          if (now - lastPumpChangeMs >= MIN_OFF_MS) {
+            regando = desired;
+            lastPumpChangeMs = now;
           }
         }
       }
-      // progMode==1 (ciclos) lo dejamos sin acción por ahora (Paso 5).
+    }
+
+    // 2) AUTO_PROGRAMADO 
+    else {
+      // Si NO estamos en ventana, apagamos y listo
+      if (!isWindowActive()) {
+        cycleState = CYCLE_IDLE;
+        regando = false;
+        lastPumpChangeMs = millis();
+      }else {
+        // Si NO estamos en ventana: apagamos + reseteamos ciclo
+      if (!isWindowActive()) {
+        cycleState = CYCLE_IDLE;
+        regando = false;
+        lastPumpChangeMs = millis();
+      }
+      else {
+        // Estamos en ventana:
+
+        // 2.1) PROG_SENSOR (igual que AUTO_SENSOR pero solo dentro de ventana)
+        if (progMode == 0) {
+          bool desired = regando;
+
+          if (regando) {
+            if (humedadPct > (umbralPct + H)) desired = false;
+          } else {
+            if (humedadPct < (umbralPct - H)) desired = true;
+          }
+
+          unsigned long now = millis();
+          if (desired != regando) {
+            if (regando) {
+              if (now - lastPumpChangeMs >= MIN_ON_MS) {
+                regando = desired;
+                lastPumpChangeMs = now;
+              }
+            } else {
+              if (now - lastPumpChangeMs >= MIN_OFF_MS) {
+                regando = desired;
+                lastPumpChangeMs = now;
+              }
+            }
+          }
+        }
+
+        // 2.2) PROG_CICLOS (PASO 5)
+        else {
+          // Asegurar que el ciclo tenga sentido
+          if (cycleOnMin >= cycleEveryMin) {
+            cycleOnMin = cycleEveryMin; // o cycleEveryMin-1 si querés forzar OFF
+          }
+
+          unsigned long now = millis();
+
+          switch (cycleState) {
+
+            case CYCLE_IDLE:
+              cycleState = CYCLE_ON;
+              cycleStateMs = now;
+              break;
+
+            case CYCLE_ON: {
+              bool wantOn = true;
+
+              // Seguridad por sensor (si está habilitada)
+              if (sensorLimitEnable && humedadPct > (umbralPct + H)) {
+                wantOn = false;
+              }
+
+              // Respetar anti-ciclo para encender
+              if (wantOn && !regando) {
+                if (now - lastPumpChangeMs >= MIN_OFF_MS) {
+                  regando = true;
+                  lastPumpChangeMs = now;
+                }
+              }
+
+              // Si no queremos ON, apagamos (respetando MIN_ON_MS)
+              if (!wantOn && regando) {
+                if (now - lastPumpChangeMs >= MIN_ON_MS) {
+                  regando = false;
+                  lastPumpChangeMs = now;
+                }
+              }
+
+              // Fin del tramo ON (el "tiempo del tramo" corre igual aunque el sensor haya cortado)
+              if (now - cycleStateMs >= (unsigned long)cycleOnMin * 60000UL) {
+                cycleState = CYCLE_OFF;
+                cycleStateMs = now;
+
+                // al pasar a OFF, apagamos (respetando min on)
+                if (regando && (now - lastPumpChangeMs >= MIN_ON_MS)) {
+                  regando = false;
+                  lastPumpChangeMs = now;
+                } else {
+                  // si no puede apagar aún por MIN_ON, igual quedará apagando en el próximo tick
+                }
+              }
+              break;
+            }
+
+            case CYCLE_OFF:
+              // asegurar OFF (respetando MIN_ON_MS si venía ON)
+              if (regando) {
+                if (now - lastPumpChangeMs >= MIN_ON_MS) {
+                  regando = false;
+                  lastPumpChangeMs = now;
+                }
+              }
+
+              // Duración OFF = cycleEveryMin - cycleOnMin
+              if (now - cycleStateMs >= (unsigned long)(cycleEveryMin - cycleOnMin) * 60000UL) {
+                cycleState = CYCLE_ON;
+                cycleStateMs = now;
+              }
+              break;
+          }
+        }
+      }
     }
   }
-}
-
-
 
   applyPumpOutput();
 
