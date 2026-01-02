@@ -20,6 +20,7 @@ volatile int humedadPct = 0;
 volatile int umbralPct  = 50;
 volatile bool modoManual = false;
 volatile bool regando = false;
+volatile int diasMask = 127;
 
 // ---------- NTP / Hora ----------
 volatile bool ntpOk = false;
@@ -31,13 +32,13 @@ const unsigned long NTP_CHECK_PERIOD_MS = 2000;  // cada 2s
 // Auto mode: 0 = AUTO_SENSOR, 1 = AUTO_PROGRAMADO
 volatile int autoMode = 0;
 
-// Programado: días de INICIO (bits 0=Dom .. 6=Sab)
-volatile int diasMask = 0b01111110; // Lun..Vie por defecto
 
 // Ventana: inicio + duración (min)
-volatile int startHour = 7;
-volatile int startMin  = 30;
-volatile int durWindowMin = 60; // 1 hora por defecto
+volatile int startHour = 0;
+volatile int startMin  = 21;
+volatile int durWindowMin = 3;
+
+
 
 // Programado: 0 = PROG_SENSOR, 1 = PROG_CICLOS
 volatile int progMode = 0;
@@ -85,7 +86,8 @@ void initNTP();
 void updateNtpStatus();
 String getLocalTimeString();
 bool isWindowActive();
-int dayStartMinuteIndex(int wday);
+void applyPumpOutput();
+
 
 
 
@@ -194,37 +196,37 @@ bool isWindowActive() {
   struct tm t;
   localtime_r(&now, &t);
 
-  int nowMinOfDay = t.tm_hour * 60 + t.tm_min; // 0..1439
-  int todayWday = t.tm_wday;                   // 0..6
+  const int nowMinOfDay = t.tm_hour * 60 + t.tm_min; // 0..1439
+  const int todayWday   = t.tm_wday;                 // 0=Dom..6=Sab
 
-  int startMin = startHour * 60 + startMin;
+  const int startOfDayMin = startHour * 60 + startMin; // <-- nombre distinto (clave)
   int dur = durWindowMin;
 
-  // Seguridad
+  // Sanitizado mínimo
   if (dur <= 0) return false;
-  if (dur > 1440) dur = 1440; // por ahora limitamos a 24h (coherente con el modelo)
+  if (dur > 1440) dur = 1440;
 
-  // Caso 1: ventana NO cruza medianoche (start + dur <= 1440)
-  if (startMin + dur <= 1440) {
-    // Activa solo si HOY es un día marcado y estamos dentro
+  // Ventana no cruza medianoche
+  if (startOfDayMin + dur <= 1440) {
     if ((diasMask & (1 << todayWday)) == 0) return false;
-    return (nowMinOfDay >= startMin) && (nowMinOfDay < (startMin + dur));
+    return (nowMinOfDay >= startOfDayMin) && (nowMinOfDay < (startOfDayMin + dur));
   }
 
-  // Caso 2: ventana cruza medianoche (ej 20:00 + 600min => termina al día siguiente)
-  int endMinNextDay = (startMin + dur) - 1440; // fin en el día siguiente (0..)
+  // Ventana cruza medianoche
+  const int endMinNextDay = (startOfDayMin + dur) - 1440;
 
-  // a) Si estamos en el tramo "antes de medianoche": hoy debe estar marcado
-  if (nowMinOfDay >= startMin) {
+  // Tramo antes de medianoche (mismo día)
+  if (nowMinOfDay >= startOfDayMin) {
     if ((diasMask & (1 << todayWday)) == 0) return false;
     return true;
   }
 
-  // b) Si estamos en el tramo "después de medianoche": debe haber arrancado AYER (marcado)
-  int ydayWday = (todayWday + 6) % 7; // ayer
+  // Tramo después de medianoche: debe haber arrancado AYER (día marcado)
+  const int ydayWday = (todayWday + 6) % 7;
   if ((diasMask & (1 << ydayWday)) == 0) return false;
   return (nowMinOfDay < endMinNextDay);
 }
+
 
 void setupServer() {
   Serial.println("[setupServer] Entrando...");
@@ -292,6 +294,55 @@ void setupServer() {
     <button id="btnToggle" onclick="toggleManualWeb()">--</button>
   </div>
 
+  <h3>Modo AUTO</h3>
+  <div class="card">
+    <div class="row"><div>autoMode</div><div><b id="autoModeTxt">--</b></div></div>
+    <button onclick="setAutoMode(0)">AUTO por sensor</button>
+    <button onclick="setAutoMode(1)">AUTO programado</button>
+  </div>
+
+  <h3>Modo Programado</h3>
+  <div class="card">
+    <div class="row"><div>progMode</div><div><b id="progModeTxt">--</b></div></div>
+    <button onclick="setProgMode(0)">Programado + sensor</button>
+    <button onclick="setProgMode(1)">Programado + ciclos</button>
+  </div>
+
+  <h3>Programación (ventana)</h3>
+  <div class="card">
+    <div class="row"><div>NTP</div><div><b id="ntpOkTxt">--</b></div></div>
+    <div class="row"><div>Hora local</div><div><code id="timeTxt">--:--:--</code></div></div>
+    <div class="row"><div>Ventana activa</div><div><b id="winActiveTxt">--</b></div></div>
+
+    <hr>
+
+    <div><b>Días de riego (inicio)</b> <small>(0=Dom ... 6=Sab)</small></div>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; margin:8px 0;">
+      <label><input type="checkbox" class="day" data-bit="0">Dom</label>
+      <label><input type="checkbox" class="day" data-bit="1">Lun</label>
+      <label><input type="checkbox" class="day" data-bit="2">Mar</label>
+      <label><input type="checkbox" class="day" data-bit="3">Mié</label>
+      <label><input type="checkbox" class="day" data-bit="4">Jue</label>
+      <label><input type="checkbox" class="day" data-bit="5">Vie</label>
+      <label><input type="checkbox" class="day" data-bit="6">Sáb</label>
+    </div>
+
+    <div class="row">
+      <div>Inicio</div>
+      <div><input id="startTime" type="time" value="00:00"></div>
+    </div>
+
+    <div class="row">
+      <div>Duración (min)</div>
+      <div><input id="durMin" type="number" min="1" max="1440" value="60" style="width:100px"></div>
+    </div>
+
+    <div class="row">
+      <button onclick="saveSchedule()">Guardar programación</button>
+      <code id="schedMsg">--</code>
+    </div>
+  </div>
+
 
   <h3>RAW /status</h3>
   <pre id="raw">(sin datos)</pre>
@@ -316,7 +367,7 @@ void setupServer() {
       // Al soltar: dejar de arrastrar y ENVIAR el valor al ESP32
       s.addEventListener('pointerup', () => {
         draggingUmb = false;
-        setUmbral();   // 👈 envío automático
+        setUmbral();   
       });
 
       s.addEventListener('pointercancel', () => {
@@ -346,6 +397,18 @@ void setupServer() {
       setTimeout(() => (btn.disabled = false), 300);
     }
 
+    async function updateWindowStatus() {
+      try {
+        const r = await fetch('/window/status?t=' + Date.now(), { cache: 'no-store' });
+        const w = await r.json();
+
+        document.getElementById('ntpOkTxt').textContent = w.ntpOk ? 'OK' : 'NO';
+        document.getElementById('timeTxt').textContent = w.time;
+        document.getElementById('winActiveTxt').textContent = w.active ? 'SI' : 'NO';
+      } catch (e) {
+        // no rompas toda la UI por esto
+      }
+    }
 
 
     async function update() {
@@ -353,7 +416,7 @@ void setupServer() {
       document.getElementById('tick').textContent = n;
 
       const url = '/status?t=' + Date.now(); // cache-buster real
-
+      
       try {
         const r = await fetch(url, { cache: 'no-store' });
         document.getElementById('http').textContent = r.status + ' ' + r.statusText;
@@ -362,6 +425,11 @@ void setupServer() {
         document.getElementById('raw').textContent = txt;
 
         const j = JSON.parse(txt);  // después parseo
+        document.getElementById('autoModeTxt').textContent =
+          (j.autoMode === 0 ? 'SENSOR' : 'PROGRAMADO');
+
+        document.getElementById('progModeTxt').textContent =
+          (j.progMode === 0 ? 'SENSOR' : 'CICLOS');
 
         document.getElementById('hum').textContent = j.humedad;
         document.getElementById('umb').textContent = j.umbral;
@@ -383,6 +451,7 @@ void setupServer() {
       } catch (e) {
         document.getElementById('err').textContent = String(e);
       }
+      await updateWindowStatus();
     }
 
 
@@ -404,10 +473,104 @@ void setupServer() {
       }
     }
 
+    async function setAutoMode(v) {
+      try {
+        await fetch('/auto/mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'value=' + encodeURIComponent(v),
+          cache: 'no-store'
+        });
+        update();
+      } catch (e) {
+        document.getElementById('err').textContent = String(e);
+      }
+    }
+
+    async function setProgMode(v) {
+      try {
+        await fetch('/prog/mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'value=' + encodeURIComponent(v),
+          cache: 'no-store'
+        });
+        update();
+      } catch (e) {
+        document.getElementById('err').textContent = String(e);
+      }
+    }
+
+    async function loadConfig() {
+      try {
+        const r = await fetch('/config/get?t=' + Date.now(), { cache: 'no-store' });
+        const cfg = await r.json();
+
+        // Días
+        document.querySelectorAll('input.day').forEach(cb => {
+          const bit = parseInt(cb.dataset.bit, 10);
+          cb.checked = ((cfg.diasMask >> bit) & 1) === 1;
+        });
+
+        // Hora inicio
+        const hh = String(cfg.startHour).padStart(2, '0');
+        const mm = String(cfg.startMin).padStart(2, '0');
+        document.getElementById('startTime').value = `${hh}:${mm}`;
+
+        // Duración
+        document.getElementById('durMin').value = cfg.durWindowMin;
+
+      } catch (e) {
+        document.getElementById('err').textContent = String(e);
+      }
+    }
+
+    function getDiasMaskFromUI() {
+      let mask = 0;
+      document.querySelectorAll('input.day').forEach(cb => {
+        const bit = parseInt(cb.dataset.bit, 10);
+        if (cb.checked) mask |= (1 << bit);
+      });
+      return mask;
+    }
+
+    async function saveSchedule() {
+      const mask = getDiasMaskFromUI();
+      const t = document.getElementById('startTime').value; // "HH:MM"
+      const parts = t.split(':');
+      const sh = parseInt(parts[0], 10);
+      const sm = parseInt(parts[1], 10);
+      const du = parseInt(document.getElementById('durMin').value, 10);
+
+      try {
+        const r = await fetch('/config/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body:
+            'diasMask=' + encodeURIComponent(mask) +
+            '&startHour=' + encodeURIComponent(sh) +
+            '&startMin=' + encodeURIComponent(sm) +
+            '&durWindowMin=' + encodeURIComponent(du),
+          cache: 'no-store'
+        });
+
+        document.getElementById('schedMsg').textContent = r.status + ' ' + r.statusText;
+        await loadConfig(); // (vuelve a traer lo guardado/sanitizado)
+        await update();     // refresca panel (hora/ventana/status)
+      } catch (e) {
+        document.getElementById('schedMsg').textContent = String(e);
+      }
+    }
 
 
-    update();
-    setInterval(update, 1000);
+
+
+    window.addEventListener('load', () => {
+      loadConfig();
+      update();
+      setInterval(update, 1000);
+    });
+
   </script>
 </body>
 </html>
@@ -451,23 +614,75 @@ void setupServer() {
 
 
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-  String json = "{";
-  json += "\"humedad\":" + String(humedadPct) + ",";
-  json += "\"umbral\":" + String(umbralPct) + ",";
-  json += "\"modo\":\"" + String(modoManual ? "MANUAL" : "AUTO") + "\",";
-  json += "\"riego\":\"" + String(regando ? "ON" : "OFF") + "\"";
-  json += "}";
+    String json = "{";
+    json += "\"humedad\":" + String(humedadPct) + ",";
+    json += "\"umbral\":" + String(umbralPct) + ",";
+    json += "\"autoMode\":" + String(autoMode) + ",";
+    json += "\"progMode\":" + String(progMode) + ",";
+    json += "\"modo\":\"" + String(modoManual ? "MANUAL" : "AUTO") + "\",";
+    json += "\"riego\":\"" + String(regando ? "ON" : "OFF") + "\"";
+    json += "}";
 
-  AsyncWebServerResponse *response =
+    AsyncWebServerResponse *response =
       request->beginResponse(200, "application/json", json);
 
-  // Evita cache en serio (browser/proxy)
-  response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  response->addHeader("Pragma", "no-cache");
-  response->addHeader("Expires", "0");
+    response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    response->addHeader("Pragma", "no-cache");
+    response->addHeader("Expires", "0");
 
-  request->send(response);
-});
+    request->send(response);
+  });
+
+  server.on("/config/get", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{";
+    json += "\"autoMode\":" + String(autoMode) + ",";
+    json += "\"progMode\":" + String(progMode) + ",";
+    json += "\"diasMask\":" + String(diasMask) + ",";
+    json += "\"startHour\":" + String(startHour) + ",";
+    json += "\"startMin\":" + String(startMin) + ",";
+    json += "\"durWindowMin\":" + String(durWindowMin) + ",";
+    json += "\"cycleEveryMin\":" + String(cycleEveryMin) + ",";
+    json += "\"cycleOnMin\":" + String(cycleOnMin) + ",";
+    json += "\"sensorLimitEnable\":" + String(sensorLimitEnable ? "true" : "false");
+    json += "}";
+
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/config/schedule", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("diasMask", true) ||
+        !request->hasParam("startHour", true) ||
+        !request->hasParam("startMin", true) ||
+        !request->hasParam("durWindowMin", true)) {
+      request->send(400, "text/plain", "Missing params");
+      return;
+    }
+
+    int dm = request->getParam("diasMask", true)->value().toInt();
+    int sh = request->getParam("startHour", true)->value().toInt();
+    int sm = request->getParam("startMin", true)->value().toInt();
+    int du = request->getParam("durWindowMin", true)->value().toInt();
+
+    // Sanitizado (mismo criterio que loadConfigFromNVS)
+    if (dm < 0) dm = 0;
+    if (dm > 127) dm = 127;
+    if (sh < 0) sh = 0;
+    if (sh > 23) sh = 23;
+    if (sm < 0) sm = 0;
+    if (sm > 59) sm = 59;
+    if (du < 1) du = 1;
+    if (du > 1440) du = 1440;
+
+    diasMask = dm;
+    startHour = sh;
+    startMin = sm;
+    durWindowMin = du;
+
+    saveConfigToNVS();
+    request->send(200, "text/plain", "OK");
+  });
+
+
 
   // ---- Set Umbral ----
   server.on("/umbral/set", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -493,6 +708,31 @@ void setupServer() {
     request->send(200, "text/plain", "OK");
   });
 
+  server.on("/auto/mode", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("value", true)) {
+      request->send(400, "text/plain", "Missing value");
+      return;
+    }
+    int v = request->getParam("value", true)->value().toInt();
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    autoMode = v;
+    saveConfigToNVS();
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/prog/mode", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("value", true)) {
+      request->send(400, "text/plain", "Missing value");
+      return;
+    }
+    int v = request->getParam("value", true)->value().toInt();
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    progMode = v;
+    saveConfigToNVS();
+    request->send(200, "text/plain", "OK");
+  });
 
 
   server.begin();
@@ -554,6 +794,10 @@ void toggleManual() {
   Serial.println(">> TOGGLE: MANUAL -> AUTO (RIEGO segun sensor)");
 }
 
+void applyPumpOutput() {
+  digitalWrite(PIN_BOMBA, regando ? HIGH : LOW);
+}
+
 
 void handleButton() {
   bool raw = digitalRead(PIN_BTN);
@@ -575,28 +819,26 @@ void handleButton() {
 void sampleAndControl() {
   humedadPct = map(analogRead(PIN_HUMEDAD), 0, 4095, 0, 100);
 
-    if (!modoManual) {
+ if (!modoManual) {
+
+  // 1) AUTO_SENSOR (como hoy)
+  if (autoMode == 0) {
     bool desired = regando;
 
-    // Histéresis: si está regando, no corta hasta superar umbral+H
     if (regando) {
       if (humedadPct > (umbralPct + H)) desired = false;
     } else {
-      // Si está apagado, no enciende hasta bajar de umbral-H
       if (humedadPct < (umbralPct - H)) desired = true;
     }
 
-    // Anti-ciclo: tiempo mínimo ON/OFF
     unsigned long now = millis();
     if (desired != regando) {
       if (regando) {
-        // quiere pasar de ON->OFF
         if (now - lastPumpChangeMs >= MIN_ON_MS) {
           regando = desired;
           lastPumpChangeMs = now;
         }
       } else {
-        // quiere pasar de OFF->ON
         if (now - lastPumpChangeMs >= MIN_OFF_MS) {
           regando = desired;
           lastPumpChangeMs = now;
@@ -605,8 +847,50 @@ void sampleAndControl() {
     }
   }
 
+  // 2) AUTO_PROGRAMADO (por ahora solo "habilita o no habilita" la posibilidad de regar)
+  else {
+    // Si NO estamos en ventana, apagamos y listo
+    if (!isWindowActive()) {
+      if (regando) {
+        regando = false;
+        lastPumpChangeMs = millis();
+      }
+    } else {
+      // Estamos en ventana:
+      // Por ahora solo implementamos PROG_SENSOR (progMode==0) usando la misma lógica que AUTO_SENSOR.
+      // PROG_CICLOS lo hacemos en Paso 5.
+      if (progMode == 0) {
+        bool desired = regando;
 
-  digitalWrite(PIN_BOMBA, regando ? HIGH : LOW);
+        if (regando) {
+          if (humedadPct > (umbralPct + H)) desired = false;
+        } else {
+          if (humedadPct < (umbralPct - H)) desired = true;
+        }
+
+        unsigned long now = millis();
+        if (desired != regando) {
+          if (regando) {
+            if (now - lastPumpChangeMs >= MIN_ON_MS) {
+              regando = desired;
+              lastPumpChangeMs = now;
+            }
+          } else {
+            if (now - lastPumpChangeMs >= MIN_OFF_MS) {
+              regando = desired;
+              lastPumpChangeMs = now;
+            }
+          }
+        }
+      }
+      // progMode==1 (ciclos) lo dejamos sin acción por ahora (Paso 5).
+    }
+  }
+}
+
+
+
+  applyPumpOutput();
 
   Serial.print("Hum=");
   Serial.print(humedadPct);
