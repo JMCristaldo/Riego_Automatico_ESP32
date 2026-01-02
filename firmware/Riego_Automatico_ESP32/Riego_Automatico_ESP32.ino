@@ -1,5 +1,4 @@
 #include <Wire.h>
-//#include <U8g2lib.h>
 #include <WiFi.h>
 #include <time.h>
 #include <AsyncTCP.h>
@@ -8,9 +7,14 @@
 
 Preferences prefs;
 
-#define PIN_HUMEDAD 32
-#define PIN_BOMBA   18
-#define PIN_BTN     15
+#define PIN_LED_HEARTBEAT 2
+#define PIN_HUMEDAD       32
+#define PIN_BOMBA         18
+#define PIN_BTN           16
+#define PIN_LED_VERDE     25
+#define PIN_LED_AMARILLO  26
+#define PIN_LED_ROJO      27
+
 
 
 // ---------- Estado del sistema ----------
@@ -19,6 +23,7 @@ volatile int umbralPct  = 50;
 volatile bool modoManual = false;
 volatile bool regando = false;
 volatile int diasMask = 127;
+
 
 enum CycleState {
   CYCLE_IDLE,   // esperando próximo ciclo
@@ -67,8 +72,8 @@ unsigned long lastPumpChangeMs = 0;  // cuándo cambió regando por última vez
 
 
 // ---------- Servidor ----------
-const char* ssid = "WiFi_Fibertel_nnk_2.4GHz";
-const char* password = "cn6vxu7bjm";
+const char* ssid = "FIBRA_COOP_9F30";
+const char* password = "HXQaCzee";
 
 AsyncWebServer server(80);
 
@@ -81,6 +86,10 @@ const unsigned long DEBOUNCE_MS = 35;
 // ---------- Tareas periódicas ----------
 unsigned long lastSampleMs = 0;
 const unsigned long SAMPLE_PERIOD_MS = 200;
+unsigned long lastHbMs = 0;
+const unsigned long HB_PERIOD_MS = 500; // parpadeo cada 500ms
+bool hbState = false;
+
 
 // ---- Prototipos de funciones ----
 void setupServer();
@@ -94,6 +103,13 @@ void updateNtpStatus();
 String getLocalTimeString();
 bool isWindowActive();
 void applyPumpOutput();
+bool safetyCutoffActive();
+void enforceSafetyCutoff();        // fuerza OFF y resetea ciclos si hace falta
+bool sensorWantsOn();              // histéresis pura (umbral +/- H)
+void applyAntiCycle(bool desired); // MIN_ON/MIN_OFF centralizado
+void runAutoSensor();
+void runProgSensor();
+void runProgCycles();
 
 
 
@@ -334,6 +350,25 @@ void setupServer() {
       <label><input type="checkbox" class="day" data-bit="6">Sáb</label>
     </div>
 
+<h3>Ciclos (solo si Programado + ciclos)</h3>
+<div class="card">
+  <div class="row"><div>Intervalo (min)</div>
+    <div><input id="cycleEveryMin" type="number" min="1" max="1440" value="30" style="width:100px"></div>
+  </div>
+
+  <div class="row"><div>Duración riego (min)</div>
+    <div><input id="cycleOnMin" type="number" min="1" max="1440" value="2" style="width:100px"></div>
+  </div>
+
+  <div class="row">
+    <button onclick="saveCycles()">Guardar ciclos</button>
+    <code id="cyclesMsg">--</code>
+  </div>
+
+  <small>Nota: en “ciclos” se ignora el umbral. Seguridad dura: corta si humedad ≥ 90%.</small>
+</div>
+
+
     <div class="row">
       <div>Inicio</div>
       <div><input id="startTime" type="time" value="00:00"></div>
@@ -527,6 +562,10 @@ void setupServer() {
         // Duración
         document.getElementById('durMin').value = cfg.durWindowMin;
 
+        //Ciclos
+        document.getElementById('cycleEveryMin').value = cfg.cycleEveryMin;
+        document.getElementById('cycleOnMin').value = cfg.cycleOnMin;
+
       } catch (e) {
         document.getElementById('err').textContent = String(e);
       }
@@ -569,6 +608,27 @@ void setupServer() {
       }
     }
 
+    async function saveCycles() {
+      const ce = parseInt(document.getElementById('cycleEveryMin').value, 10);
+      const co = parseInt(document.getElementById('cycleOnMin').value, 10);
+
+      try {
+        const r = await fetch('/config/cycles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body:
+            'cycleEveryMin=' + encodeURIComponent(ce) +
+            '&cycleOnMin=' + encodeURIComponent(co),
+          cache: 'no-store'
+        });
+
+        document.getElementById('cyclesMsg').textContent = r.status + ' ' + r.statusText;
+        await loadConfig();
+        await update();
+      } catch (e) {
+        document.getElementById('cyclesMsg').textContent = String(e);
+      }
+    }
 
 
 
@@ -689,6 +749,31 @@ void setupServer() {
     request->send(200, "text/plain", "OK");
   });
 
+server.on("/config/cycles", HTTP_POST, [](AsyncWebServerRequest *request) {
+  if (!request->hasParam("cycleEveryMin", true) ||
+      !request->hasParam("cycleOnMin", true)) {
+    request->send(400, "text/plain", "Missing params");
+    return;
+  }
+
+  int ce = request->getParam("cycleEveryMin", true)->value().toInt();
+  int co = request->getParam("cycleOnMin", true)->value().toInt();
+
+  // Sanitizado
+  if (ce < 1) ce = 1;
+  if (ce > 1440) ce = 1440;
+
+  if (co < 1) co = 1;
+  if (co > 1440) co = 1440;
+
+  if (co > ce) co = ce;
+
+  cycleEveryMin = ce;
+  cycleOnMin = co;
+
+  saveConfigToNVS();
+  request->send(200, "text/plain", "OK");
+});
 
 
   // ---- Set Umbral ----
@@ -750,9 +835,18 @@ void setup() {
   Serial.begin(115200);
   lastPumpChangeMs = millis() - MIN_OFF_MS;  // permite encender inmediatamente si corresponde
 
-
+  pinMode(PIN_LED_HEARTBEAT, OUTPUT);
   pinMode(PIN_BOMBA, OUTPUT);
+  pinMode(PIN_LED_VERDE, OUTPUT);
+  pinMode(PIN_LED_AMARILLO, OUTPUT);
+  pinMode(PIN_LED_ROJO, OUTPUT);
+
   digitalWrite(PIN_BOMBA, LOW);
+  digitalWrite(PIN_LED_VERDE, LOW);
+  digitalWrite(PIN_LED_AMARILLO, LOW);
+  digitalWrite(PIN_LED_ROJO, LOW);
+  digitalWrite(PIN_LED_HEARTBEAT, LOW);
+
   prefs.begin("riego", false);
   loadConfigFromNVS();
   Serial.print("Umbral cargado: ");
@@ -801,8 +895,40 @@ void toggleManual() {
   Serial.println(">> TOGGLE: MANUAL -> AUTO (RIEGO segun sensor)");
 }
 
+void heartbeat() {
+  unsigned long now = millis();
+  if (now - lastHbMs >= HB_PERIOD_MS) {
+    lastHbMs = now;
+    hbState = !hbState;
+    digitalWrite(PIN_LED_HEARTBEAT, hbState ? HIGH : LOW);
+  }
+}
+
+
 void applyPumpOutput() {
   digitalWrite(PIN_BOMBA, regando ? HIGH : LOW);
+}
+
+void applyStatusLeds() {
+  // 🟡 Manual
+  digitalWrite(PIN_LED_AMARILLO, modoManual ? HIGH : LOW);
+
+  // 🔴 Bomba (estado real)
+  digitalWrite(PIN_LED_ROJO, regando ? HIGH : LOW);
+
+  // 🟢 “Sistema habilitado”
+  // Encendido si:
+  // - autoMode==0 (sensor) => siempre habilitado
+  // - autoMode==1 (programado) => solo habilitado si NTP ok y ventana activa
+  bool habilitado = false;
+
+  if (autoMode == 0) {
+    habilitado = true;
+  } else {
+    habilitado = (ntpOk && isWindowActive());
+  }
+
+  digitalWrite(PIN_LED_VERDE, habilitado ? HIGH : LOW);
 }
 
 
@@ -823,171 +949,134 @@ void handleButton() {
   }
 }
 
-void sampleAndControl() {
-  humedadPct = map(analogRead(PIN_HUMEDAD), 0, 4095, 0, 100);
- 
-
-  if (!modoManual) {
-
-    // 1) AUTO_SENSOR (como hoy)
-    if (autoMode == 0) {
-      bool desired = regando;
-
-      if (regando) {
-        if (humedadPct > (umbralPct + H)) desired = false;
-      } else {
-        if (humedadPct < (umbralPct - H)) desired = true;
-      }
-
-      unsigned long now = millis();
-      if (desired != regando) {
-        if (regando) {
-          if (now - lastPumpChangeMs >= MIN_ON_MS) {
-            regando = desired;
-            lastPumpChangeMs = now;
-          }
-        } else {
-          if (now - lastPumpChangeMs >= MIN_OFF_MS) {
-            regando = desired;
-            lastPumpChangeMs = now;
-          }
-        }
-      }
-    }
-
-    // 2) AUTO_PROGRAMADO 
-    else {
-      // Si NO estamos en ventana, apagamos y listo
-      if (!isWindowActive()) {
-        cycleState = CYCLE_IDLE;
-        regando = false;
-        lastPumpChangeMs = millis();
-      }else {
-        // Si NO estamos en ventana: apagamos + reseteamos ciclo
-      if (!isWindowActive()) {
-        cycleState = CYCLE_IDLE;
-        regando = false;
-        lastPumpChangeMs = millis();
-      }
-      else {
-        // Estamos en ventana:
-
-        // 2.1) PROG_SENSOR (igual que AUTO_SENSOR pero solo dentro de ventana)
-        if (progMode == 0) {
-          bool desired = regando;
-
-          if (regando) {
-            if (humedadPct > (umbralPct + H)) desired = false;
-          } else {
-            if (humedadPct < (umbralPct - H)) desired = true;
-          }
-
-          unsigned long now = millis();
-          if (desired != regando) {
-            if (regando) {
-              if (now - lastPumpChangeMs >= MIN_ON_MS) {
-                regando = desired;
-                lastPumpChangeMs = now;
-              }
-            } else {
-              if (now - lastPumpChangeMs >= MIN_OFF_MS) {
-                regando = desired;
-                lastPumpChangeMs = now;
-              }
-            }
-          }
-        }
-
-        // 2.2) PROG_CICLOS (PASO 5)
-        else {
-          // Asegurar que el ciclo tenga sentido
-          if (cycleOnMin >= cycleEveryMin) {
-            cycleOnMin = cycleEveryMin; // o cycleEveryMin-1 si querés forzar OFF
-          }
-
-          unsigned long now = millis();
-
-          switch (cycleState) {
-
-            case CYCLE_IDLE:
-              cycleState = CYCLE_ON;
-              cycleStateMs = now;
-              break;
-
-            case CYCLE_ON: {
-              bool wantOn = true;
-
-              // Seguridad por sensor (si está habilitada)
-              if (sensorLimitEnable && humedadPct > (umbralPct + H)) {
-                wantOn = false;
-              }
-
-              // Respetar anti-ciclo para encender
-              if (wantOn && !regando) {
-                if (now - lastPumpChangeMs >= MIN_OFF_MS) {
-                  regando = true;
-                  lastPumpChangeMs = now;
-                }
-              }
-
-              // Si no queremos ON, apagamos (respetando MIN_ON_MS)
-              if (!wantOn && regando) {
-                if (now - lastPumpChangeMs >= MIN_ON_MS) {
-                  regando = false;
-                  lastPumpChangeMs = now;
-                }
-              }
-
-              // Fin del tramo ON (el "tiempo del tramo" corre igual aunque el sensor haya cortado)
-              if (now - cycleStateMs >= (unsigned long)cycleOnMin * 60000UL) {
-                cycleState = CYCLE_OFF;
-                cycleStateMs = now;
-
-                // al pasar a OFF, apagamos (respetando min on)
-                if (regando && (now - lastPumpChangeMs >= MIN_ON_MS)) {
-                  regando = false;
-                  lastPumpChangeMs = now;
-                } else {
-                  // si no puede apagar aún por MIN_ON, igual quedará apagando en el próximo tick
-                }
-              }
-              break;
-            }
-
-            case CYCLE_OFF:
-              // asegurar OFF (respetando MIN_ON_MS si venía ON)
-              if (regando) {
-                if (now - lastPumpChangeMs >= MIN_ON_MS) {
-                  regando = false;
-                  lastPumpChangeMs = now;
-                }
-              }
-
-              // Duración OFF = cycleEveryMin - cycleOnMin
-              if (now - cycleStateMs >= (unsigned long)(cycleEveryMin - cycleOnMin) * 60000UL) {
-                cycleState = CYCLE_ON;
-                cycleStateMs = now;
-              }
-              break;
-          }
-        }
-      }
-    }
-  }
-
-  applyPumpOutput();
-
-  Serial.print("Hum=");
-  Serial.print(humedadPct);
-  Serial.print("% Umbral=");
-  Serial.print(umbralPct);
-  Serial.print("% | Modo=");
-  Serial.print(modoManual ? "MAN" : "AUTO");
-  Serial.print(" | Bomba=");
-  Serial.println(regando ? "ON" : "OFF");
+bool safetyCutoffActive() {
+  return (humedadPct >= 90);
 }
 
+void enforceSafetyCutoff() {
+  if (!safetyCutoffActive()) return;
+
+  // Corta SIEMPRE e inmediato (no respeta MIN_ON por ser seguridad)
+  if (regando) {
+    regando = false;
+    lastPumpChangeMs = millis();
+  }
+
+  // Resetea ciclos para re-arrancar limpio cuando vuelva a ser seguro
+  cycleState = CYCLE_IDLE;
+}
+
+bool sensorWantsOn() {
+  // Histéresis pura (sin MIN_ON/MIN_OFF)
+  if (regando) {
+    return !(humedadPct > (umbralPct + H));   // mantiene ON hasta superar umbral+H
+  } else {
+    return (humedadPct < (umbralPct - H));    // enciende recién bajo umbral-H
+  }
+}
+
+void applyAntiCycle(bool desired) {
+  unsigned long now = millis();
+  if (desired == regando) return;
+
+  if (regando) {
+    // ON -> OFF
+    if (now - lastPumpChangeMs >= MIN_ON_MS) {
+      regando = false;
+      lastPumpChangeMs = now;
+    }
+  } else {
+    // OFF -> ON
+    if (now - lastPumpChangeMs >= MIN_OFF_MS) {
+      regando = true;
+      lastPumpChangeMs = now;
+    }
+  }
+}
+
+void runAutoSensor() {
+  bool desired = sensorWantsOn();
+  applyAntiCycle(desired);
+}
+
+void runProgSensor() {
+  // Igual que AUTO sensor, pero ya sabemos que estamos en ventana
+  bool desired = sensorWantsOn();
+  applyAntiCycle(desired);
+}
+
+void runProgCycles() {
+  // Programado + ciclos: IGNORA UMBRAL (salvo seguridad dura 90% que ya se chequea antes)
+  if (cycleOnMin >= cycleEveryMin) cycleOnMin = cycleEveryMin;
+
+  unsigned long now = millis();
+
+  if (cycleState == CYCLE_IDLE) {
+    cycleState = CYCLE_ON;
+    cycleStateMs = now;
+  }
+
+  if (cycleState == CYCLE_ON) {
+    // Durante ON: queremos ON sí o sí (sin mirar sensor/umbral)
+    applyAntiCycle(true);
+
+    if (now - cycleStateMs >= (unsigned long)cycleOnMin * 60000UL) {
+      cycleState = CYCLE_OFF;
+      cycleStateMs = now;
+      applyAntiCycle(false);
+    }
+    return;
+  }
+
+  // CYCLE_OFF
+  applyAntiCycle(false);
+
+  unsigned long offMs = (unsigned long)(cycleEveryMin - cycleOnMin) * 60000UL;
+  if (now - cycleStateMs >= offMs) {
+    cycleState = CYCLE_ON;
+    cycleStateMs = now;
+  }
+}
+
+void sampleAndControl() {
+  humedadPct = map(analogRead(PIN_HUMEDAD), 0, 4095, 0, 100);
+
+  // Seguridad dura: corta siempre (AUTO/MANUAL) y resetea ciclos
+  enforceSafetyCutoff();
+
+  // Si estás en MANUAL, no hacemos control automático.
+  // (pero la seguridad ya pudo cortar la bomba arriba)
+  if (modoManual) return;
+
+  // AUTO por sensor
+  if (autoMode == 0) {
+    runAutoSensor();
+    return;
+  }
+
+  // AUTO programado: fuera de ventana => OFF + reset ciclos
+  if (!isWindowActive()) {
+    cycleState = CYCLE_IDLE;
+    if (regando) {
+      regando = false;
+      lastPumpChangeMs = millis();
+    }
+    return;
+  }
+
+  // Dentro de ventana:
+  if (progMode == 0) {
+    runProgSensor();
+  } else {
+    runProgCycles();
+  }
+}
+
+
 void loop() {
+
+  heartbeat();
+
   handleButton();
 
   updateNtpStatus();
@@ -997,5 +1086,6 @@ void loop() {
   if (now - lastSampleMs >= SAMPLE_PERIOD_MS) {
     lastSampleMs = now;
     sampleAndControl();
+    applyStatusLeds();
   }
 }
