@@ -23,7 +23,8 @@ volatile int umbralPct  = 50;
 volatile bool modoManual = false;
 volatile bool regando = false;
 volatile int diasMask = 127;
-
+volatile int runMode = 0;
+volatile int prevRunMode = 0;
 
 enum CycleState {
   CYCLE_IDLE,   // esperando próximo ciclo
@@ -38,11 +39,6 @@ unsigned long cycleStateMs = 0;   // marca de tiempo del último cambio
 volatile bool ntpOk = false;
 unsigned long lastNtpCheckMs = 0;
 const unsigned long NTP_CHECK_PERIOD_MS = 2000;  // cada 2s
-
-
-// ---------- Config AUTO / Programado (persistente) ----------
-// Auto mode: 0 = AUTO_SENSOR, 1 = AUTO_PROGRAMADO
-volatile int autoMode = 0;
 
 
 // Ventana: inicio + duración (min)
@@ -72,8 +68,8 @@ unsigned long lastPumpChangeMs = 0;  // cuándo cambió regando por última vez
 
 
 // ---------- Servidor ----------
-const char* ssid = "FIBRA_COOP_9F30";
-const char* password = "HXQaCzee";
+const char* ssid = "WiFi_Fibertel_nnk_2.4GHz";
+const char* password = "cn6vxu7bjm";
 
 AsyncWebServer server(80);
 
@@ -110,6 +106,7 @@ void applyAntiCycle(bool desired); // MIN_ON/MIN_OFF centralizado
 void runAutoSensor();
 void runProgSensor();
 void runProgCycles();
+void onConfigChanged(bool stopPumpIfAuto);
 
 
 
@@ -118,7 +115,7 @@ void loadConfigFromNVS() {
   // Si no existe la key, mantiene el default actual (segundo parámetro)
   umbralPct = prefs.getInt("umbral", umbralPct);
 
-  autoMode = prefs.getInt("autoMode", autoMode);
+  runMode = prefs.getInt("runMode", runMode);
   diasMask = prefs.getInt("diasMask", diasMask);
 
   startHour = prefs.getInt("stH", startHour);
@@ -136,8 +133,9 @@ void loadConfigFromNVS() {
   if (umbralPct < 0) umbralPct = 0;
   if (umbralPct > 100) umbralPct = 100;
 
-  if (autoMode < 0) autoMode = 0;
-  if (autoMode > 1) autoMode = 1;
+
+  if (runMode < 0) runMode = 0;
+  if (runMode > 2) runMode = 2;
 
   if (diasMask < 0) diasMask = 0;
   if (diasMask > 127) diasMask = 127;
@@ -164,7 +162,7 @@ void loadConfigFromNVS() {
 void saveConfigToNVS() {
   prefs.putInt("umbral", umbralPct);
 
-  prefs.putInt("autoMode", autoMode);
+  prefs.putInt("runMode", runMode);
   prefs.putInt("diasMask", diasMask);
 
   prefs.putInt("stH", startHour);
@@ -312,23 +310,16 @@ void setupServer() {
   </div>
 
 
-  <h3>Control</h3>
+  <h3>Modo</h3>
   <div class="card">
-    <button id="btnToggle" onclick="toggleManualWeb()">--</button>
-  </div>
+    <button onclick="setMainMode(1)">Automático</button>
+    <button onclick="setMainMode(2)">Programado</button>
+    <button onclick="setMainMode(0)">Manual</button>
+    <button onclick="setMainMode(3)">Apagado</button>
 
-  <h3>Modo AUTO</h3>
-  <div class="card">
-    <div class="row"><div>autoMode</div><div><b id="autoModeTxt">--</b></div></div>
-    <button onclick="setAutoMode(0)">AUTO por sensor</button>
-    <button onclick="setAutoMode(1)">AUTO programado</button>
-  </div>
-
-  <h3>Modo Programado</h3>
-  <div class="card">
-    <div class="row"><div>progMode</div><div><b id="progModeTxt">--</b></div></div>
-    <button onclick="setProgMode(0)">Programado + sensor</button>
-    <button onclick="setProgMode(1)">Programado + ciclos</button>
+    <div style="margin-top:8px;">
+      <code id="modeMsg">--</code>
+    </div>
   </div>
 
   <h3>Programación (ventana)</h3>
@@ -351,7 +342,8 @@ void setupServer() {
     </div>
 
 <h3>Ciclos (solo si Programado + ciclos)</h3>
-<div class="card">
+<div class="card" id="cyclesCard">
+
   <div class="row"><div>Intervalo (min)</div>
     <div><input id="cycleEveryMin" type="number" min="1" max="1440" value="30" style="width:100px"></div>
   </div>
@@ -360,14 +352,9 @@ void setupServer() {
     <div><input id="cycleOnMin" type="number" min="1" max="1440" value="2" style="width:100px"></div>
   </div>
 
-  <div class="row">
-    <button onclick="saveCycles()">Guardar ciclos</button>
-    <code id="cyclesMsg">--</code>
-  </div>
 
   <small>Nota: en “ciclos” se ignora el umbral. Seguridad dura: corta si humedad ≥ 90%.</small>
 </div>
-
 
     <div class="row">
       <div>Inicio</div>
@@ -379,10 +366,17 @@ void setupServer() {
       <div><input id="durMin" type="number" min="1" max="1440" value="60" style="width:100px"></div>
     </div>
 
-    <div class="row">
-      <button onclick="saveSchedule()">Guardar programación</button>
-      <code id="schedMsg">--</code>
+    <div class="row" style="gap:10px; flex-wrap:wrap;">
+      <button onclick="saveProgram(0)">Sensor</button>
+      <button onclick="saveProgram(1)">Ciclos</button>
+      <code id="progMsg">--</code>
     </div>
+
+    <small>
+      “Sensor” = riega según umbral dentro de la ventana.<br>
+      “Ciclos” = riega por intervalo/duración dentro de la ventana (seguridad dura 90%).
+    </small>
+
   </div>
 
 
@@ -425,20 +419,6 @@ void setupServer() {
       }
     }
 
-    async function toggleManualWeb() {
-      const btn = document.getElementById('btnToggle');
-      btn.disabled = true;
-
-      try {
-        await fetch('/manual/toggle', { method: 'POST', cache: 'no-store' });
-        update();
-      } catch (e) {
-        document.getElementById('err').textContent = String(e);
-      }
-
-      setTimeout(() => (btn.disabled = false), 300);
-    }
-
     async function updateWindowStatus() {
       try {
         const r = await fetch('/window/status?t=' + Date.now(), { cache: 'no-store' });
@@ -467,24 +447,27 @@ void setupServer() {
         document.getElementById('raw').textContent = txt;
 
         const j = JSON.parse(txt);  // después parseo
-        document.getElementById('autoModeTxt').textContent =
-          (j.autoMode === 0 ? 'SENSOR' : 'PROGRAMADO');
+        
 
-        document.getElementById('progModeTxt').textContent =
-          (j.progMode === 0 ? 'SENSOR' : 'CICLOS');
+        
 
         document.getElementById('hum').textContent = j.humedad;
         document.getElementById('umb').textContent = j.umbral;
         syncUmbralUI(j.umbral);
-        document.getElementById('modo').textContent = j.modo;
         
-        const btn = document.getElementById('btnToggle');
+        let modoTxt = '';
 
-        if (j.modo === "AUTO") {
-          btn.textContent = "Pasar a MANUAL (Riego ON)";
+        if (j.modo === 'MANUAL') {
+          modoTxt = 'MANUAL';
         } else {
-          btn.textContent = "Volver a AUTO";
+          // j.modo == "AUTO" pero lo desglosamos por runMode
+          if (j.runMode === 0) modoTxt = 'AUTOMÁTICO';
+          else if (j.runMode === 1) modoTxt = 'PROGRAMADO';
+          else if (j.runMode === 2) modoTxt = 'APAGADO';
+          else modoTxt = 'AUTO(?)';
         }
+
+        document.getElementById('modo').textContent = modoTxt;
 
         document.getElementById('riego').textContent = j.riego;
 
@@ -515,33 +498,6 @@ void setupServer() {
       }
     }
 
-    async function setAutoMode(v) {
-      try {
-        await fetch('/auto/mode', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'value=' + encodeURIComponent(v),
-          cache: 'no-store'
-        });
-        update();
-      } catch (e) {
-        document.getElementById('err').textContent = String(e);
-      }
-    }
-
-    async function setProgMode(v) {
-      try {
-        await fetch('/prog/mode', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'value=' + encodeURIComponent(v),
-          cache: 'no-store'
-        });
-        update();
-      } catch (e) {
-        document.getElementById('err').textContent = String(e);
-      }
-    }
 
     async function loadConfig() {
       try {
@@ -566,6 +522,10 @@ void setupServer() {
         document.getElementById('cycleEveryMin').value = cfg.cycleEveryMin;
         document.getElementById('cycleOnMin').value = cfg.cycleOnMin;
 
+        // Mostrar/ocultar card de ciclos según progMode guardado
+        const cc = document.getElementById('cyclesCard');
+        if (cc) cc.style.display = (cfg.progMode === 1) ? 'block' : 'none';
+
       } catch (e) {
         document.getElementById('err').textContent = String(e);
       }
@@ -580,56 +540,57 @@ void setupServer() {
       return mask;
     }
 
-    async function saveSchedule() {
+    async function saveProgram(pm) {
       const mask = getDiasMaskFromUI();
+
       const t = document.getElementById('startTime').value; // "HH:MM"
       const parts = t.split(':');
       const sh = parseInt(parts[0], 10);
       const sm = parseInt(parts[1], 10);
+
       const du = parseInt(document.getElementById('durMin').value, 10);
 
-      try {
-        const r = await fetch('/config/schedule', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body:
-            'diasMask=' + encodeURIComponent(mask) +
-            '&startHour=' + encodeURIComponent(sh) +
-            '&startMin=' + encodeURIComponent(sm) +
-            '&durWindowMin=' + encodeURIComponent(du),
-          cache: 'no-store'
-        });
-
-        document.getElementById('schedMsg').textContent = r.status + ' ' + r.statusText;
-        await loadConfig(); // (vuelve a traer lo guardado/sanitizado)
-        await update();     // refresca panel (hora/ventana/status)
-      } catch (e) {
-        document.getElementById('schedMsg').textContent = String(e);
-      }
-    }
-
-    async function saveCycles() {
       const ce = parseInt(document.getElementById('cycleEveryMin').value, 10);
       const co = parseInt(document.getElementById('cycleOnMin').value, 10);
 
       try {
-        const r = await fetch('/config/cycles', {
+        const r = await fetch('/config/program', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body:
-            'cycleEveryMin=' + encodeURIComponent(ce) +
+            'progMode=' + encodeURIComponent(pm) +
+            '&diasMask=' + encodeURIComponent(mask) +
+            '&startHour=' + encodeURIComponent(sh) +
+            '&startMin=' + encodeURIComponent(sm) +
+            '&durWindowMin=' + encodeURIComponent(du) +
+            '&cycleEveryMin=' + encodeURIComponent(ce) +
             '&cycleOnMin=' + encodeURIComponent(co),
           cache: 'no-store'
         });
 
-        document.getElementById('cyclesMsg').textContent = r.status + ' ' + r.statusText;
-        await loadConfig();
-        await update();
+        document.getElementById('progMsg').textContent = r.status + ' ' + r.statusText;
+        await loadConfig();  // trae sanitizado
+        await update();      // refresca status/ventana
       } catch (e) {
-        document.getElementById('cyclesMsg').textContent = String(e);
+        document.getElementById('progMsg').textContent = String(e);
       }
     }
 
+
+    async function setMainMode(v) {
+      try {
+        const r = await fetch('/mode/set', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'value=' + encodeURIComponent(v),
+          cache: 'no-store'
+        });
+        document.getElementById('modeMsg').textContent = r.status + ' ' + r.statusText;
+        await update();
+      } catch (e) {
+        document.getElementById('modeMsg').textContent = String(e);
+      }
+    }
 
 
     window.addEventListener('load', () => {
@@ -657,14 +618,6 @@ void setupServer() {
     request->send(200, "text/plain", "OK");
   });
 
-  server.on("/time/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String json = "{";
-    json += "\"ntpOk\":" + String(ntpOk ? "true" : "false") + ",";
-    json += "\"time\":\"" + getLocalTimeString() + "\"";
-    json += "}";
-
-    request->send(200, "application/json", json);
-  });
 
   server.on("/window/status", HTTP_GET, [](AsyncWebServerRequest *request) {
     String json = "{";
@@ -684,9 +637,9 @@ void setupServer() {
     String json = "{";
     json += "\"humedad\":" + String(humedadPct) + ",";
     json += "\"umbral\":" + String(umbralPct) + ",";
-    json += "\"autoMode\":" + String(autoMode) + ",";
     json += "\"progMode\":" + String(progMode) + ",";
     json += "\"modo\":\"" + String(modoManual ? "MANUAL" : "AUTO") + "\",";
+    json += "\"runMode\":" + String(runMode) + ",";
     json += "\"riego\":\"" + String(regando ? "ON" : "OFF") + "\"";
     json += "}";
 
@@ -702,7 +655,6 @@ void setupServer() {
 
   server.on("/config/get", HTTP_GET, [](AsyncWebServerRequest *request) {
     String json = "{";
-    json += "\"autoMode\":" + String(autoMode) + ",";
     json += "\"progMode\":" + String(progMode) + ",";
     json += "\"diasMask\":" + String(diasMask) + ",";
     json += "\"startHour\":" + String(startHour) + ",";
@@ -716,64 +668,61 @@ void setupServer() {
     request->send(200, "application/json", json);
   });
 
-  server.on("/config/schedule", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("diasMask", true) ||
-        !request->hasParam("startHour", true) ||
-        !request->hasParam("startMin", true) ||
-        !request->hasParam("durWindowMin", true)) {
-      request->send(400, "text/plain", "Missing params");
-      return;
+  server.on("/config/program", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // Requiere todo junto
+    const char* keys[] = {"progMode","diasMask","startHour","startMin","durWindowMin","cycleEveryMin","cycleOnMin"};
+    for (auto k : keys) {
+      if (!request->hasParam(k, true)) {
+        request->send(400, "text/plain", String("Missing param: ") + k);
+        return;
+      }
     }
 
+    int pm = request->getParam("progMode", true)->value().toInt();
     int dm = request->getParam("diasMask", true)->value().toInt();
     int sh = request->getParam("startHour", true)->value().toInt();
     int sm = request->getParam("startMin", true)->value().toInt();
     int du = request->getParam("durWindowMin", true)->value().toInt();
+    int ce = request->getParam("cycleEveryMin", true)->value().toInt();
+    int co = request->getParam("cycleOnMin", true)->value().toInt();
 
-    // Sanitizado (mismo criterio que loadConfigFromNVS)
+    // Sanitizado (mismo criterio que venís usando)
+    if (pm < 0) pm = 0;
+    if (pm > 1) pm = 1;
+
     if (dm < 0) dm = 0;
     if (dm > 127) dm = 127;
+
     if (sh < 0) sh = 0;
     if (sh > 23) sh = 23;
+
     if (sm < 0) sm = 0;
     if (sm > 59) sm = 59;
+
     if (du < 1) du = 1;
     if (du > 1440) du = 1440;
 
+    if (ce < 1) ce = 1;
+    if (ce > 1440) ce = 1440;
+
+    if (co < 1) co = 1;
+    if (co > 1440) co = 1440;
+    if (co > ce) co = ce;
+
+    // Aplicar
+    progMode = pm;
     diasMask = dm;
     startHour = sh;
     startMin = sm;
     durWindowMin = du;
+    cycleEveryMin = ce;
+    cycleOnMin = co;
 
+    onConfigChanged(true);
     saveConfigToNVS();
+
     request->send(200, "text/plain", "OK");
   });
-
-server.on("/config/cycles", HTTP_POST, [](AsyncWebServerRequest *request) {
-  if (!request->hasParam("cycleEveryMin", true) ||
-      !request->hasParam("cycleOnMin", true)) {
-    request->send(400, "text/plain", "Missing params");
-    return;
-  }
-
-  int ce = request->getParam("cycleEveryMin", true)->value().toInt();
-  int co = request->getParam("cycleOnMin", true)->value().toInt();
-
-  // Sanitizado
-  if (ce < 1) ce = 1;
-  if (ce > 1440) ce = 1440;
-
-  if (co < 1) co = 1;
-  if (co > 1440) co = 1440;
-
-  if (co > ce) co = ce;
-
-  cycleEveryMin = ce;
-  cycleOnMin = co;
-
-  saveConfigToNVS();
-  request->send(200, "text/plain", "OK");
-});
 
 
   // ---- Set Umbral ----
@@ -795,36 +744,49 @@ server.on("/config/cycles", HTTP_POST, [](AsyncWebServerRequest *request) {
     request->send(200, "text/plain", "OK");
   });
 
-  server.on("/manual/toggle", HTTP_POST, [](AsyncWebServerRequest *request) {
-    toggleManual();
-    request->send(200, "text/plain", "OK");
-  });
-
-  server.on("/auto/mode", HTTP_POST, [](AsyncWebServerRequest *request) {
+  server.on("/mode/set", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("value", true)) {
       request->send(400, "text/plain", "Missing value");
       return;
     }
+
     int v = request->getParam("value", true)->value().toInt();
-    if (v < 0) v = 0;
-    if (v > 1) v = 1;
-    autoMode = v;
+    // 0=MANUAL, 1=AUTO, 2=PROGRAMADO, 3=APAGADO
+    if (v < 0) v = 1;
+    if (v > 3) v = 1;
+
+    if (v == 0) {
+      // UI: MANUAL siempre ON (sin toggle, sin restore)
+      modoManual = true;
+      regando = true;
+      lastPumpChangeMs = millis();
+      request->send(200, "text/plain", "MANUAL_ON");
+      return;
+    }
+
+    // Si tocan cualquier otro modo, salimos de manual
+    if (modoManual) {
+      modoManual = false;
+    }
+
+    if (v == 1) runMode = 0; // AUTO
+    if (v == 2) runMode = 1; // PROGRAMADO
+    if (v == 3) runMode = 2; // APAGADO
+
+    prevRunMode = runMode; 
+
+    onConfigChanged(true);
     saveConfigToNVS();
     request->send(200, "text/plain", "OK");
   });
 
-  server.on("/prog/mode", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("value", true)) {
-      request->send(400, "text/plain", "Missing value");
-      return;
-    }
-    int v = request->getParam("value", true)->value().toInt();
-    if (v < 0) v = 0;
-    if (v > 1) v = 1;
-    progMode = v;
-    saveConfigToNVS();
+  server.on("/nvs/cleanup", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // borra keys viejas (si existen)
+    prefs.remove("autoMode");
+
     request->send(200, "text/plain", "OK");
   });
+
 
 
   server.begin();
@@ -863,37 +825,26 @@ void setup() {
 
 void toggleManual() {
   if (!modoManual) {
-    // AUTO -> MANUAL (siempre riego ON)
+    // Entrar a MANUAL (por botón físico): guardar modo anterior
+    prevRunMode = runMode;
     modoManual = true;
     regando = true;
     lastPumpChangeMs = millis();
-    Serial.println(">> TOGGLE: AUTO -> MANUAL (RIEGO ON)");
+    Serial.println(">> BTN: -> MANUAL (restore habilitado)");
     return;
   }
 
-  // MANUAL -> AUTO (riego depende del control)
+  // Salir de MANUAL (por botón físico): volver al modo anterior
   modoManual = false;
-  lastPumpChangeMs = millis(); // marca transición
+  runMode = prevRunMode;
 
-  // Forzamos una evaluación inmediata (sin esperar al próximo ciclo)
-  // Usamos la misma lógica que en sampleAndControl, pero aplicada ya.
-  bool desired = regando;
+  onConfigChanged(true);
+  saveConfigToNVS();
 
-  if (regando) {
-    if (humedadPct > (umbralPct + H)) desired = false;
-  } else {
-    if (humedadPct < (umbralPct - H)) desired = true;
-  }
-
-  // Al volver a AUTO, queremos que "dependa del sensor" ya mismo.
-  // Para cumplir tu expectativa, aplicamos el cambio inmediato (sin MIN_ON/OFF en esta transición).
-  if (desired != regando) {
-    regando = desired;
-    lastPumpChangeMs = millis();
-  }
-
-  Serial.println(">> TOGGLE: MANUAL -> AUTO (RIEGO segun sensor)");
+  Serial.println(">> BTN: MANUAL -> restore prevRunMode");
 }
+
+
 
 void heartbeat() {
   unsigned long now = millis();
@@ -910,25 +861,41 @@ void applyPumpOutput() {
 }
 
 void applyStatusLeds() {
-  // 🟡 Manual
+  // Manual
   digitalWrite(PIN_LED_AMARILLO, modoManual ? HIGH : LOW);
 
-  // 🔴 Bomba (estado real)
+  // Bomba (estado real)
   digitalWrite(PIN_LED_ROJO, regando ? HIGH : LOW);
 
-  // 🟢 “Sistema habilitado”
-  // Encendido si:
-  // - autoMode==0 (sensor) => siempre habilitado
-  // - autoMode==1 (programado) => solo habilitado si NTP ok y ventana activa
+  // “Sistema habilitado”
   bool habilitado = false;
 
-  if (autoMode == 0) {
-    habilitado = true;
+  if (runMode == 2) {
+    habilitado = false; // apagado
+  } else if (runMode == 0) {
+    habilitado = true;  // auto sensor siempre “habilitado”
   } else {
-    habilitado = (ntpOk && isWindowActive());
+    habilitado = (ntpOk && isWindowActive()); // programado
   }
 
+
   digitalWrite(PIN_LED_VERDE, habilitado ? HIGH : LOW);
+}
+
+void onConfigChanged(bool stopPumpIfAuto) {
+  // Reset de estados internos para evitar “solapamientos”
+  cycleState = CYCLE_IDLE;
+  cycleStateMs = millis();
+
+  // Si estamos en AUTO, lo más seguro es cortar inmediatamente
+  // (si estás en MANUAL, respetamos manual salvo seguridad dura).
+  if (stopPumpIfAuto && !modoManual) {
+    regando = false;
+
+    // Importante: dejá listo el anti-ciclo para permitir encender cuando corresponda
+    // (si querés que pueda re-encender enseguida al volver a estar “habilitado”)
+    lastPumpChangeMs = millis() - MIN_OFF_MS;
+  }
 }
 
 
@@ -964,6 +931,8 @@ void enforceSafetyCutoff() {
 
   // Resetea ciclos para re-arrancar limpio cuando vuelva a ser seguro
   cycleState = CYCLE_IDLE;
+  cycleStateMs = millis();
+
 }
 
 bool sensorWantsOn() {
@@ -1006,6 +975,16 @@ void runProgSensor() {
 }
 
 void runProgCycles() {
+  
+  // Límite por sensor (opcional) en modo ciclos:
+  // si ya estamos por arriba del umbral + histéresis, NO regar y resetear ciclos.
+  if (sensorLimitEnable && (humedadPct >= (umbralPct + H))) {
+    applyAntiCycle(false);     // pedir OFF (respetando MIN_ON si estuviera ON)
+    cycleState = CYCLE_IDLE;   // re-arranca limpio cuando baje
+    cycleStateMs = millis();
+    return;
+  }
+
   // Programado + ciclos: IGNORA UMBRAL (salvo seguridad dura 90% que ya se chequea antes)
   if (cycleOnMin >= cycleEveryMin) cycleOnMin = cycleEveryMin;
 
@@ -1032,6 +1011,8 @@ void runProgCycles() {
   applyAntiCycle(false);
 
   unsigned long offMs = (unsigned long)(cycleEveryMin - cycleOnMin) * 60000UL;
+  if (offMs < 1000UL) offMs = 1000UL;
+
   if (now - cycleStateMs >= offMs) {
     cycleState = CYCLE_ON;
     cycleStateMs = now;
@@ -1048,13 +1029,23 @@ void sampleAndControl() {
   // (pero la seguridad ya pudo cortar la bomba arriba)
   if (modoManual) return;
 
+    // APAGADO: no se riega por nada (solo manual podría prender, pero manual ya salió arriba)
+  if (runMode == 2) {
+    if (regando) {
+      regando = false;
+      lastPumpChangeMs = millis();
+    }
+    cycleState = CYCLE_IDLE;
+    return;
+  }
+
   // AUTO por sensor
-  if (autoMode == 0) {
+  if (runMode == 0) {
     runAutoSensor();
     return;
   }
 
-  // AUTO programado: fuera de ventana => OFF + reset ciclos
+    // PROGRAMADO: fuera de ventana => OFF + reset ciclos
   if (!isWindowActive()) {
     cycleState = CYCLE_IDLE;
     if (regando) {
@@ -1065,11 +1056,8 @@ void sampleAndControl() {
   }
 
   // Dentro de ventana:
-  if (progMode == 0) {
-    runProgSensor();
-  } else {
-    runProgCycles();
-  }
+  if (progMode == 0) runProgSensor();
+  else runProgCycles();
 }
 
 
@@ -1085,7 +1073,8 @@ void loop() {
 
   if (now - lastSampleMs >= SAMPLE_PERIOD_MS) {
     lastSampleMs = now;
-    sampleAndControl();
-    applyStatusLeds();
+    sampleAndControl();   // solo decide "regando"
+    applyPumpOutput();    // SIEMPRE escribe GPIO18
+    applyStatusLeds();    // LEDs de estado (GPIO25/26/27)
   }
 }
