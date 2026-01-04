@@ -24,7 +24,11 @@ volatile bool modoManual = false;
 volatile bool regando = false;
 volatile int diasMask = 127;
 volatile int runMode = 0;
+
+// Estado previo solo para restore del botón físico
 volatile int prevRunMode = 0;
+volatile int prevProgMode = 0;
+
 
 enum CycleState {
   CYCLE_IDLE,   // esperando próximo ciclo
@@ -43,8 +47,8 @@ const unsigned long NTP_CHECK_PERIOD_MS = 2000;  // cada 2s
 
 // Ventana: inicio + duración (min)
 volatile int startHour = 0;
-volatile int startMin  = 21;
-volatile int durWindowMin = 3;
+volatile int startMin = 0;
+volatile int durWindowMin = 60;
 
 
 
@@ -53,7 +57,7 @@ volatile int progMode = 0;
 
 // Ciclos X/Y (min)
 volatile int cycleEveryMin = 30; // cada X minutos
-volatile int cycleOnMin    = 2;  // riega Y minutos
+volatile int cycleOnMin = 2;  // riega Y minutos
 
 // Seguridad por sensor en ciclos
 volatile bool sensorLimitEnable = true;
@@ -283,6 +287,13 @@ void setupServer() {
     pre { background:#f4f4f4; padding:10px; border-radius:10px; overflow:auto; }
     .err { color:#b00020; }
     code { background:#f4f4f4; padding:2px 6px; border-radius:6px; }
+    .btn{
+      padding: 12px 14px;
+      margin: 4px 4px 0 0;
+      border-radius: 10px;
+    }
+    .btn { min-height: 44px; }
+
   </style>
 </head>
 <body>
@@ -312,15 +323,17 @@ void setupServer() {
 
   <h3>Modo</h3>
   <div class="card">
-    <button onclick="setMainMode(1)">Automático</button>
-    <button onclick="setMainMode(2)">Programado</button>
-    <button onclick="setMainMode(0)">Manual</button>
-    <button onclick="setMainMode(3)">Apagado</button>
+    <button class="btn" onclick="setMainMode(1)">Automático</button>
+    <button class="btn" onclick="saveAndSetProgram(0)">Programado + Sensor</button>
+    <button class="btn" onclick="saveAndSetProgram(1)">Programado + Ciclos</button>
+    <button class="btn" onclick="setMainMode(0)">Manual</button>
+    <button class="btn" onclick="setMainMode(3)">Apagado</button>
 
     <div style="margin-top:8px;">
       <code id="modeMsg">--</code>
     </div>
   </div>
+
 
   <h3>Programación (ventana)</h3>
   <div class="card">
@@ -341,7 +354,7 @@ void setupServer() {
       <label><input type="checkbox" class="day" data-bit="6">Sáb</label>
     </div>
 
-<h3>Ciclos (solo si Programado + ciclos)</h3>
+<h3>Ciclos</h3>
 <div class="card" id="cyclesCard">
 
   <div class="row"><div>Intervalo (min)</div>
@@ -366,16 +379,6 @@ void setupServer() {
       <div><input id="durMin" type="number" min="1" max="1440" value="60" style="width:100px"></div>
     </div>
 
-    <div class="row" style="gap:10px; flex-wrap:wrap;">
-      <button onclick="saveProgram(0)">Sensor</button>
-      <button onclick="saveProgram(1)">Ciclos</button>
-      <code id="progMsg">--</code>
-    </div>
-
-    <small>
-      “Sensor” = riega según umbral dentro de la ventana.<br>
-      “Ciclos” = riega por intervalo/duración dentro de la ventana (seguridad dura 90%).
-    </small>
 
   </div>
 
@@ -460,14 +463,20 @@ void setupServer() {
         if (j.modo === 'MANUAL') {
           modoTxt = 'MANUAL';
         } else {
-          // j.modo == "AUTO" pero lo desglosamos por runMode
-          if (j.runMode === 0) modoTxt = 'AUTOMÁTICO';
-          else if (j.runMode === 1) modoTxt = 'PROGRAMADO';
-          else if (j.runMode === 2) modoTxt = 'APAGADO';
-          else modoTxt = 'AUTO(?)';
+          // AUTO pero lo desglosamos por runMode + progMode
+          if (j.runMode === 0) {
+            modoTxt = 'AUTOMÁTICO';
+          } else if (j.runMode === 1) {
+            modoTxt = (j.progMode === 1) ? 'PROGRAMADO + CICLOS' : 'PROGRAMADO + SENSOR';
+          } else if (j.runMode === 2) {
+            modoTxt = 'APAGADO';
+          } else {
+            modoTxt = 'AUTO(?)';
+          }
         }
 
         document.getElementById('modo').textContent = modoTxt;
+
 
         document.getElementById('riego').textContent = j.riego;
 
@@ -522,10 +531,6 @@ void setupServer() {
         document.getElementById('cycleEveryMin').value = cfg.cycleEveryMin;
         document.getElementById('cycleOnMin').value = cfg.cycleOnMin;
 
-        // Mostrar/ocultar card de ciclos según progMode guardado
-        const cc = document.getElementById('cyclesCard');
-        if (cc) cc.style.display = (cfg.progMode === 1) ? 'block' : 'none';
-
       } catch (e) {
         document.getElementById('err').textContent = String(e);
       }
@@ -540,7 +545,8 @@ void setupServer() {
       return mask;
     }
 
-    async function saveProgram(pm) {
+    async function saveAndSetProgram(pm) {
+      // 1) Guardar configuración + progMode
       const mask = getDiasMaskFromUI();
 
       const t = document.getElementById('startTime').value; // "HH:MM"
@@ -549,12 +555,11 @@ void setupServer() {
       const sm = parseInt(parts[1], 10);
 
       const du = parseInt(document.getElementById('durMin').value, 10);
-
       const ce = parseInt(document.getElementById('cycleEveryMin').value, 10);
       const co = parseInt(document.getElementById('cycleOnMin').value, 10);
 
       try {
-        const r = await fetch('/config/program', {
+        const r1 = await fetch('/config/program', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body:
@@ -568,13 +573,27 @@ void setupServer() {
           cache: 'no-store'
         });
 
-        document.getElementById('progMsg').textContent = r.status + ' ' + r.statusText;
+        // 2) Activar modo PROGRAMADO + (sensor/ciclos)
+        const modeValue = (pm === 0) ? 2 : 4;
+
+        const r2 = await fetch('/mode/set', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'value=' + encodeURIComponent(modeValue),
+          cache: 'no-store'
+        });
+
+
+        document.getElementById('modeMsg').textContent =
+          `CFG:${r1.status} ${r1.statusText} | MODE:${r2.status} ${r2.statusText}`;
+
         await loadConfig();  // trae sanitizado
         await update();      // refresca status/ventana
       } catch (e) {
-        document.getElementById('progMsg').textContent = String(e);
+        document.getElementById('modeMsg').textContent = String(e);
       }
     }
+
 
 
     async function setMainMode(v) {
@@ -751,12 +770,19 @@ void setupServer() {
     }
 
     int v = request->getParam("value", true)->value().toInt();
-    // 0=MANUAL, 1=AUTO, 2=PROGRAMADO, 3=APAGADO
-    if (v < 0) v = 1;
-    if (v > 3) v = 1;
 
+    // Códigos UI:
+    // 0=MANUAL (ON fijo)
+    // 1=AUTO
+    // 2=PROGRAMADO + SENSOR
+    // 3=APAGADO
+    // 4=PROGRAMADO + CICLOS
+    if (v < 0) v = 1;
+    if (v > 4) v = 1;
+
+
+    // MANUAL UI
     if (v == 0) {
-      // UI: MANUAL siempre ON (sin toggle, sin restore)
       modoManual = true;
       regando = true;
       lastPumpChangeMs = millis();
@@ -764,21 +790,28 @@ void setupServer() {
       return;
     }
 
-    // Si tocan cualquier otro modo, salimos de manual
-    if (modoManual) {
-      modoManual = false;
+    // salimos de manual al entrar a cualquier modo no-manual
+    if (modoManual) modoManual = false;
+
+    // AUTO / APAGADO / PROGRAMADO
+    if (v == 1) {
+      runMode = 0;      // AUTO
+    } else if (v == 3) {
+      runMode = 2;      // APAGADO
+    } else if (v == 2) {
+      runMode = 1;      // PROGRAMADO
+      progMode = 0;     // SENSOR
+    } else if (v == 4) {
+      runMode = 1;      // PROGRAMADO
+      progMode = 1;     // CICLOS
     }
 
-    if (v == 1) runMode = 0; // AUTO
-    if (v == 2) runMode = 1; // PROGRAMADO
-    if (v == 3) runMode = 2; // APAGADO
-
-    prevRunMode = runMode; 
 
     onConfigChanged(true);
     saveConfigToNVS();
     request->send(200, "text/plain", "OK");
   });
+
 
   server.on("/nvs/cleanup", HTTP_POST, [](AsyncWebServerRequest *request) {
     // borra keys viejas (si existen)
@@ -827,6 +860,7 @@ void toggleManual() {
   if (!modoManual) {
     // Entrar a MANUAL (por botón físico): guardar modo anterior
     prevRunMode = runMode;
+    prevProgMode = progMode;
     modoManual = true;
     regando = true;
     lastPumpChangeMs = millis();
@@ -837,6 +871,7 @@ void toggleManual() {
   // Salir de MANUAL (por botón físico): volver al modo anterior
   modoManual = false;
   runMode = prevRunMode;
+  progMode = prevprogMode;
 
   onConfigChanged(true);
   saveConfigToNVS();
