@@ -1,4 +1,5 @@
 #include <Wire.h>
+#include <math.h>
 #include <WiFi.h>
 #include <time.h>
 #include <AsyncTCP.h>
@@ -14,7 +15,7 @@ Preferences prefs;
 #define PIN_LED_VERDE     25
 #define PIN_LED_AMARILLO  26
 #define PIN_LED_ROJO      27
-
+#define PIN_DHT           17  // reservado para DHT22 (DATA)
 
 
 // ---------- Estado del sistema ----------
@@ -24,6 +25,13 @@ volatile bool modoManual = false;
 volatile bool regando = false;
 volatile int diasMask = 127;
 volatile int runMode = 0;
+
+// --- Futuro sensor ambiente (DHT22) ---
+
+volatile float tempC = NAN;
+volatile float humAirPct = NAN;
+volatile bool dhtOk = false;
+
 
 // Estado previo solo para restore del botón físico
 volatile int prevRunMode = 0;
@@ -111,6 +119,8 @@ void runAutoSensor();
 void runProgSensor();
 void runProgCycles();
 void onConfigChanged(bool stopPumpIfAuto);
+void enterManual(bool savePrev);
+void exitManual(bool restorePrev);
 
 
 
@@ -292,11 +302,35 @@ void setupServer() {
       margin: 4px 4px 0 0;
       border-radius: 10px;
     }
-    .btn { min-height: 44px; }
+
+    #bottomBar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      display: flex;
+      background: #111;
+    }
+
+    #bottomBar button {
+      flex: 1;
+      padding: 14px;
+      border: none;
+      color: white;
+      background: #222;
+    }
+
+    body {
+      padding-bottom: 60px;
+    }
+
 
   </style>
 </head>
 <body>
+
+<div id="dashboardView">
+
   <h2>Riego ESP32 - DEBUG</h2>
 
   <div class="card">
@@ -305,6 +339,8 @@ void setupServer() {
     <div class="row"><div>Error</div><div><code id="err" class="err">--</code></div></div>
     <div class="row"><div>Humedad</div><div><b id="hum">--</b>%</div></div>
     <div class="row"><div>Umbral</div><div><b id="umb">--</b>%</div></div>
+    <div class="row"><div>Temp</div><div><b id="temp">--</b>°C</div></div>
+    <div class="row"><div>Hum. aire</div><div><b id="humAir">--</b>%</div></div> 
     <div class="row"><div>Modo</div><div><b id="modo">--</b></div></div>
     <div class="row"><div>Riego</div><div><b id="riego">--</b></div></div>
     <div class="row"><div>Hora</div><div><code id="ts">--</code></div></div>
@@ -323,19 +359,37 @@ void setupServer() {
 
   <h3>Modo</h3>
   <div class="card">
-    <button class="btn" onclick="setMainMode(1)">Automático</button>
-    <button class="btn" onclick="saveAndSetProgram(0)">Programado + Sensor</button>
-    <button class="btn" onclick="saveAndSetProgram(1)">Programado + Ciclos</button>
-    <button class="btn" onclick="setMainMode(0)">Manual</button>
-    <button class="btn" onclick="setMainMode(3)">Apagado</button>
+
+  <select id="modeSelect" onchange="onModeChange(this.value)">
+    <option value="1">Automático</option>
+    <option value="2">Programado + Sensor</option>
+    <option value="4">Programado + Ciclos</option>
+    <option value="3">Apagado</option>
+  </select>
+
 
     <div style="margin-top:8px;">
       <code id="modeMsg">--</code>
     </div>
   </div>
 
+  <h3>Manual</h3>
+  <div class="card">
+    <label>
+      <input type="checkbox" id="manualSwitch" onchange="onManualToggle(this.checked)">
+      Riego manual (forzar ON)
+    </label>
+    <div style="margin-top:8px;">
+      <small>Al apagar vuelve al modo anterior automáticamente.</small>
+    </div>
+  </div>
 
+
+</div> <!-- dashboardView -->
+
+<div id="configView" style="display:none">
   <h3>Programación (ventana)</h3>
+
   <div class="card">
     <div class="row"><div>NTP</div><div><b id="ntpOkTxt">--</b></div></div>
     <div class="row"><div>Hora local</div><div><code id="timeTxt">--:--:--</code></div></div>
@@ -386,6 +440,8 @@ void setupServer() {
   <h3>RAW /status</h3>
   <pre id="raw">(sin datos)</pre>
 
+</div> <!-- configView -->
+
   <script>
     let n = 0;
     let draggingUmb = false;
@@ -435,6 +491,7 @@ void setupServer() {
       }
     }
 
+    let manualActive = false;
 
     async function update() {
       n++;
@@ -450,9 +507,33 @@ void setupServer() {
         document.getElementById('raw').textContent = txt;
 
         const j = JSON.parse(txt);  // después parseo
-        
+
+        manualActive = j.manual;
+
+        document.getElementById('manualSwitch').checked = manualActive;
+        document.getElementById('modeSelect').disabled = manualActive;
+
+        if (!manualActive) {
+          if (j.runMode === 0) modeSelect.value = 1;
+          else if (j.runMode === 2) modeSelect.value = 3;
+          else if (j.runMode === 1) {
+            modeSelect.value = (j.progMode === 1) ? 4 : 2;
+          }
+        }
 
         
+        // DHT (por ahora puede venir null)
+        if (j.dhtOk && j.tempC != null) {
+          document.getElementById('temp').textContent = Number(j.tempC).toFixed(1);
+        } else {
+          document.getElementById('temp').textContent = '--';
+        }
+
+        if (j.dhtOk && j.humAir != null) {
+          document.getElementById('humAir').textContent = Number(j.humAir).toFixed(1);
+        } else {
+          document.getElementById('humAir').textContent = '--';
+        }
 
         document.getElementById('hum').textContent = j.humedad;
         document.getElementById('umb').textContent = j.umbral;
@@ -545,56 +626,6 @@ void setupServer() {
       return mask;
     }
 
-    async function saveAndSetProgram(pm) {
-      // 1) Guardar configuración + progMode
-      const mask = getDiasMaskFromUI();
-
-      const t = document.getElementById('startTime').value; // "HH:MM"
-      const parts = t.split(':');
-      const sh = parseInt(parts[0], 10);
-      const sm = parseInt(parts[1], 10);
-
-      const du = parseInt(document.getElementById('durMin').value, 10);
-      const ce = parseInt(document.getElementById('cycleEveryMin').value, 10);
-      const co = parseInt(document.getElementById('cycleOnMin').value, 10);
-
-      try {
-        const r1 = await fetch('/config/program', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body:
-            'progMode=' + encodeURIComponent(pm) +
-            '&diasMask=' + encodeURIComponent(mask) +
-            '&startHour=' + encodeURIComponent(sh) +
-            '&startMin=' + encodeURIComponent(sm) +
-            '&durWindowMin=' + encodeURIComponent(du) +
-            '&cycleEveryMin=' + encodeURIComponent(ce) +
-            '&cycleOnMin=' + encodeURIComponent(co),
-          cache: 'no-store'
-        });
-
-        // 2) Activar modo PROGRAMADO + (sensor/ciclos)
-        const modeValue = (pm === 0) ? 2 : 4;
-
-        const r2 = await fetch('/mode/set', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'value=' + encodeURIComponent(modeValue),
-          cache: 'no-store'
-        });
-
-
-        document.getElementById('modeMsg').textContent =
-          `CFG:${r1.status} ${r1.statusText} | MODE:${r2.status} ${r2.statusText}`;
-
-        await loadConfig();  // trae sanitizado
-        await update();      // refresca status/ventana
-      } catch (e) {
-        document.getElementById('modeMsg').textContent = String(e);
-      }
-    }
-
-
 
     async function setMainMode(v) {
       try {
@@ -618,7 +649,39 @@ void setupServer() {
       setInterval(update, 1000);
     });
 
+
+function showDashboard() {
+  document.getElementById('dashboardView').style.display = 'block';
+  document.getElementById('configView').style.display = 'none';
+}
+
+function showConfig() {
+  document.getElementById('dashboardView').style.display = 'none';
+  document.getElementById('configView').style.display = 'block';
+}
+
+    async function onModeChange(v) {
+      if (manualActive) return;
+      await setMainMode(v);
+    }
+
+    async function onManualToggle(on) {
+      await fetch('/manual/set', {
+        method: 'POST',
+        headers: {'Content-Type':'application/x-www-form-urlencoded'},
+        body: 'value=' + (on ? '1' : '0')
+      });
+    }
+
+
   </script>
+
+  <div id="bottomBar">
+    <button onclick="showDashboard()">Dashboard</button>
+    <button onclick="showConfig()">Configuración</button>
+  </div>
+
+
 </body>
 </html>
 )rawliteral";
@@ -658,8 +721,20 @@ void setupServer() {
     json += "\"umbral\":" + String(umbralPct) + ",";
     json += "\"progMode\":" + String(progMode) + ",";
     json += "\"modo\":\"" + String(modoManual ? "MANUAL" : "AUTO") + "\",";
+    json += "\"manual\":" + String(modoManual ? "true" : "false") + ",";
     json += "\"runMode\":" + String(runMode) + ",";
-    json += "\"riego\":\"" + String(regando ? "ON" : "OFF") + "\"";
+    json += "\"riego\":\"" + String(regando ? "ON" : "OFF") + "\",";
+
+    // --- DHT (placeholder por ahora) ---
+    json += "\"dhtOk\":" + String(dhtOk ? "true" : "false") + ",";
+    if (dhtOk) {
+      json += "\"tempC\":" + String(tempC, 1) + ",";
+      json += "\"humAir\":" + String(humAirPct, 1);
+    } else {
+      json += "\"tempC\":null,";
+      json += "\"humAir\":null";
+    }
+
     json += "}";
 
     AsyncWebServerResponse *response =
@@ -671,6 +746,7 @@ void setupServer() {
 
     request->send(response);
   });
+
 
   server.on("/config/get", HTTP_GET, [](AsyncWebServerRequest *request) {
     String json = "{";
@@ -780,19 +856,6 @@ void setupServer() {
     if (v < 0) v = 1;
     if (v > 4) v = 1;
 
-
-    // MANUAL UI
-    if (v == 0) {
-      modoManual = true;
-      regando = true;
-      lastPumpChangeMs = millis();
-      request->send(200, "text/plain", "MANUAL_ON");
-      return;
-    }
-
-    // salimos de manual al entrar a cualquier modo no-manual
-    if (modoManual) modoManual = false;
-
     // AUTO / APAGADO / PROGRAMADO
     if (v == 1) {
       runMode = 0;      // AUTO
@@ -806,8 +869,31 @@ void setupServer() {
       progMode = 1;     // CICLOS
     }
 
+    // Salir siempre de manual al cambiar modo desde UI
+    if (modoManual) {
+      modoManual = false;
+    }
+
 
     onConfigChanged(true);
+    saveConfigToNVS();
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/manual/set", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("value", true)) {
+      request->send(400, "text/plain", "Missing value");
+      return;
+    }
+
+    int v = request->getParam("value", true)->value().toInt();
+
+    if (v == 1) {
+      enterManual(true);
+    } else {
+      exitManual(true);
+    }
+
     saveConfigToNVS();
     request->send(200, "text/plain", "OK");
   });
@@ -858,26 +944,15 @@ void setup() {
 
 void toggleManual() {
   if (!modoManual) {
-    // Entrar a MANUAL (por botón físico): guardar modo anterior
-    prevRunMode = runMode;
-    prevProgMode = progMode;
-    modoManual = true;
-    regando = true;
-    lastPumpChangeMs = millis();
+    enterManual(true);
     Serial.println(">> BTN: -> MANUAL (restore habilitado)");
-    return;
+  } else {
+    exitManual(true);
+    saveConfigToNVS();
+    Serial.println(">> BTN: MANUAL -> restore");
   }
-
-  // Salir de MANUAL (por botón físico): volver al modo anterior
-  modoManual = false;
-  runMode = prevRunMode;
-  progMode = prevprogMode;
-
-  onConfigChanged(true);
-  saveConfigToNVS();
-
-  Serial.println(">> BTN: MANUAL -> restore prevRunMode");
 }
+
 
 
 
@@ -931,6 +1006,25 @@ void onConfigChanged(bool stopPumpIfAuto) {
     // (si querés que pueda re-encender enseguida al volver a estar “habilitado”)
     lastPumpChangeMs = millis() - MIN_OFF_MS;
   }
+}
+
+void enterManual(bool savePrev) {
+  if (savePrev) {
+    prevRunMode = runMode;
+    prevProgMode = progMode;
+  }
+  modoManual = true;
+  regando = true;
+  lastPumpChangeMs = millis();
+}
+
+void exitManual(bool restorePrev) {
+  modoManual = false;
+  if (restorePrev) {
+    runMode = prevRunMode;
+    progMode = prevProgMode;
+  }
+  onConfigChanged(true);
 }
 
 
