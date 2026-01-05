@@ -38,26 +38,17 @@ volatile int prevRunMode = 0;
 volatile int prevProgMode = 0;
 
 
-enum CycleState {
-  CYCLE_IDLE,   // esperando próximo ciclo
-  CYCLE_ON,    // regando Y minutos
-  CYCLE_OFF    // esperando X minutos
-};
-volatile CycleState cycleState = CYCLE_IDLE;
-unsigned long cycleStateMs = 0;   // marca de tiempo del último cambio
-
-
 // ---------- NTP / Hora ----------
 volatile bool ntpOk = false;
 unsigned long lastNtpCheckMs = 0;
 const unsigned long NTP_CHECK_PERIOD_MS = 2000;  // cada 2s
 
 
-// Ventana: inicio + duración (min)
+// Ventana: inicio + fin (HH:MM)
 volatile int startHour = 0;
-volatile int startMin = 0;
-volatile int durWindowMin = 60;
-
+volatile int startMin  = 0;
+volatile int endHour   = 18;
+volatile int endMin    = 0;
 
 
 // Programado: 0 = PROG_SENSOR, 1 = PROG_CICLOS
@@ -66,9 +57,6 @@ volatile int progMode = 0;
 // Ciclos X/Y (min)
 volatile int cycleEveryMin = 30; // cada X minutos
 volatile int cycleOnMin = 2;  // riega Y minutos
-
-// Seguridad por sensor en ciclos
-volatile bool sensorLimitEnable = true;
 
 
 // --- Anti-ciclo / histéresis ---
@@ -134,14 +122,26 @@ void loadConfigFromNVS() {
 
   startHour = prefs.getInt("stH", startHour);
   startMin  = prefs.getInt("stM", startMin);
-  durWindowMin = prefs.getInt("durW", durWindowMin);
+  endHour = prefs.getInt("enH", endHour);
+  endMin  = prefs.getInt("enM", endMin);
+
+  // --- Migración desde ventana por duración (legacy) ---
+  if (!prefs.isKey("enH") || !prefs.isKey("enM")) {
+    int dur = prefs.getInt("durW", -1);
+    if (dur > 0) {
+      int startTotal = startHour * 60 + startMin;
+      int endTotal = (startTotal + dur) % 1440;
+
+      endHour = endTotal / 60;
+      endMin  = endTotal % 60;
+    }
+  }
 
   progMode = prefs.getInt("progMode", progMode);
 
   cycleEveryMin = prefs.getInt("cyEvery", cycleEveryMin);
   cycleOnMin    = prefs.getInt("cyOn", cycleOnMin);
 
-  sensorLimitEnable = prefs.getBool("sensLim", sensorLimitEnable);
 
   // Sanitizado mínimo (para no cargar basura si alguna vez se guarda mal)
   if (umbralPct < 0) umbralPct = 0;
@@ -160,9 +160,6 @@ void loadConfigFromNVS() {
   if (startMin < 0) startMin = 0;
   if (startMin > 59) startMin = 59;
 
-  if (durWindowMin < 1) durWindowMin = 1;
-  if (durWindowMin > 1440) durWindowMin = 1440;
-
   if (progMode < 0) progMode = 0;
   if (progMode > 1) progMode = 1;
 
@@ -171,6 +168,13 @@ void loadConfigFromNVS() {
 
   if (cycleOnMin < 1) cycleOnMin = 1;
   if (cycleOnMin > 1440) cycleOnMin = 1440;
+
+  if (endHour < 0) endHour = 0;
+  if (endHour > 23) endHour = 23;
+
+  if (endMin < 0) endMin = 0;
+  if (endMin > 59) endMin = 59;
+
 }
 
 void saveConfigToNVS() {
@@ -181,14 +185,14 @@ void saveConfigToNVS() {
 
   prefs.putInt("stH", startHour);
   prefs.putInt("stM", startMin);
-  prefs.putInt("durW", durWindowMin);
 
-  prefs.putInt("progMode", progMode);
+  prefs.putInt("enH", endHour);
+  prefs.putInt("enM", endMin);
 
   prefs.putInt("cyEvery", cycleEveryMin);
   prefs.putInt("cyOn", cycleOnMin);
 
-  prefs.putBool("sensLim", sensorLimitEnable);
+  prefs.putInt("progMode", progMode);
 }
 
 void initNTP() {
@@ -231,35 +235,65 @@ bool isWindowActive() {
   struct tm t;
   localtime_r(&now, &t);
 
-  const int nowMinOfDay = t.tm_hour * 60 + t.tm_min; // 0..1439
-  const int todayWday   = t.tm_wday;                 // 0=Dom..6=Sab
+  const int nowMin = t.tm_hour * 60 + t.tm_min;   // 0..1439
+  const int today  = t.tm_wday;                   // 0=Dom..6=Sab
 
-  const int startOfDayMin = startHour * 60 + startMin; // <-- nombre distinto (clave)
-  int dur = durWindowMin;
+  const int startMinDay = startHour * 60 + startMin;
+  const int endMinDay   = endHour   * 60 + endMin;
 
-  // Sanitizado mínimo
-  if (dur <= 0) return false;
-  if (dur > 1440) dur = 1440;
-
-  // Ventana no cruza medianoche
-  if (startOfDayMin + dur <= 1440) {
-    if ((diasMask & (1 << todayWday)) == 0) return false;
-    return (nowMinOfDay >= startOfDayMin) && (nowMinOfDay < (startOfDayMin + dur));
+  // Ventana NO cruza medianoche
+  if (startMinDay < endMinDay) {
+    if ((diasMask & (1 << today)) == 0) return false;
+    return (nowMin >= startMinDay) && (nowMin < endMinDay);
   }
 
-  // Ventana cruza medianoche
-  const int endMinNextDay = (startOfDayMin + dur) - 1440;
-
-  // Tramo antes de medianoche (mismo día)
-  if (nowMinOfDay >= startOfDayMin) {
-    if ((diasMask & (1 << todayWday)) == 0) return false;
+  // Ventana CRUZA medianoche
+  // Ej: 20:00 -> 04:00
+  if (nowMin >= startMinDay) {
+    // Tramo inicial (día de inicio)
+    if ((diasMask & (1 << today)) == 0) return false;
     return true;
   }
 
-  // Tramo después de medianoche: debe haber arrancado AYER (día marcado)
-  const int ydayWday = (todayWday + 6) % 7;
-  if ((diasMask & (1 << ydayWday)) == 0) return false;
-  return (nowMinOfDay < endMinNextDay);
+  // Tramo después de medianoche
+  // Pertenece al día anterior
+  int yesterday = (today + 6) % 7;
+  if ((diasMask & (1 << yesterday)) == 0) return false;
+  return (nowMin < endMinDay);
+}
+
+int windowElapsedMin() {
+  if (!ntpOk) return -1;
+
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+
+  const int nowMin = t.tm_hour * 60 + t.tm_min; // 0..1439
+  const int today  = t.tm_wday;                 // 0=Dom..6=Sab
+
+  const int startMinDay = startHour * 60 + startMin;
+  const int endMinDay   = endHour   * 60 + endMin;
+
+  // Ventana NO cruza medianoche
+  if (startMinDay < endMinDay) {
+    if ((diasMask & (1 << today)) == 0) return -1;
+    if (nowMin < startMinDay || nowMin >= endMinDay) return -1;
+    return nowMin - startMinDay;
+  }
+
+  // Ventana CRUZA medianoche (ej 20:00->04:00)
+  if (nowMin >= startMinDay) {
+    // tramo antes de medianoche (día de inicio)
+    if ((diasMask & (1 << today)) == 0) return -1;
+    return nowMin - startMinDay;
+  }
+
+  // tramo después de medianoche (pertenece al día anterior)
+  const int yesterday = (today + 6) % 7;
+  if ((diasMask & (1 << yesterday)) == 0) return -1;
+  if (nowMin >= endMinDay) return -1;  // por seguridad
+  return (1440 - startMinDay) + nowMin;
 }
 
 
@@ -423,15 +457,24 @@ void setupServer() {
   <small>Nota: en “ciclos” se ignora el umbral. Seguridad dura: corta si humedad ≥ 90%.</small>
 </div>
 
-    <div class="row">
-      <div>Inicio</div>
-      <div><input id="startTime" type="time" value="00:00"></div>
-    </div>
+  <div class="row">
+    <div>Inicio</div>
+    <div><input id="startTime" type="time" value="00:00"></div>
+  </div>
 
-    <div class="row">
-      <div>Duración (min)</div>
-      <div><input id="durMin" type="number" min="1" max="1440" value="60" style="width:100px"></div>
+  <div class="row">
+    <div>Fin</div>
+    <div><input id="endTime" type="time" value="18:00"></div>
+  </div>
+
+  <div style="margin-top:12px;">
+    <button class="btn" onclick="saveConfig()">
+      Guardar configuración
+    </button>
+    <div style="margin-top:6px;">
+      <small id="cfgMsg">—</small>
     </div>
+  </div>
 
 
   </div>
@@ -486,6 +529,11 @@ void setupServer() {
         document.getElementById('ntpOkTxt').textContent = w.ntpOk ? 'OK' : 'NO';
         document.getElementById('timeTxt').textContent = w.time;
         document.getElementById('winActiveTxt').textContent = w.active ? 'SI' : 'NO';
+        if (w.start && w.end) {
+          document.getElementById('winActiveTxt').textContent =
+            (w.active ? 'SI' : 'NO') + ` (${w.start} → ${w.end})`;
+        }
+
       } catch (e) {
         // no rompas toda la UI por esto
       }
@@ -605,8 +653,11 @@ void setupServer() {
         const mm = String(cfg.startMin).padStart(2, '0');
         document.getElementById('startTime').value = `${hh}:${mm}`;
 
-        // Duración
-        document.getElementById('durMin').value = cfg.durWindowMin;
+        // Hora fin
+        const eh = String(cfg.endHour).padStart(2, '0');
+        const em = String(cfg.endMin).padStart(2, '0');
+        document.getElementById('endTime').value = `${eh}:${em}`;
+
 
         //Ciclos
         document.getElementById('cycleEveryMin').value = cfg.cycleEveryMin;
@@ -650,15 +701,18 @@ void setupServer() {
     });
 
 
-function showDashboard() {
-  document.getElementById('dashboardView').style.display = 'block';
-  document.getElementById('configView').style.display = 'none';
-}
+    function showDashboard() {
+      document.getElementById('dashboardView').style.display = 'block';
+      document.getElementById('configView').style.display = 'none';
+    }
 
-function showConfig() {
-  document.getElementById('dashboardView').style.display = 'none';
-  document.getElementById('configView').style.display = 'block';
-}
+    async function showConfig() {
+      document.getElementById('dashboardView').style.display = 'none';
+      document.getElementById('configView').style.display = 'block';
+
+      await loadConfig();
+      await updateWindowStatus();
+    }
 
     async function onModeChange(v) {
       if (manualActive) return;
@@ -672,6 +726,59 @@ function showConfig() {
         body: 'value=' + (on ? '1' : '0')
       });
     }
+
+    async function saveConfig() {
+      const mask = getDiasMaskFromUI();
+
+      // Inicio
+      const tStart = document.getElementById('startTime').value;
+      const s = tStart.split(':');
+      const sh = parseInt(s[0], 10);
+      const sm = parseInt(s[1], 10);
+
+      // Fin
+      const tEnd = document.getElementById('endTime').value;
+      const e = tEnd.split(':');
+      const eh = parseInt(e[0], 10);
+      const em = parseInt(e[1], 10);
+
+      // Ciclos
+      const ce = parseInt(document.getElementById('cycleEveryMin').value, 10);
+      const co = parseInt(document.getElementById('cycleOnMin').value, 10);
+
+      if (co >= ce) {
+        document.getElementById('cfgMsg').textContent =
+          'Error: la duración debe ser menor que el intervalo';
+        return;
+      }
+
+
+      try {
+        const r = await fetch('/config/program', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body:
+            'diasMask=' + encodeURIComponent(mask) +
+            '&startHour=' + encodeURIComponent(sh) +
+            '&startMin=' + encodeURIComponent(sm) +
+            '&endHour=' + encodeURIComponent(eh) +
+            '&endMin=' + encodeURIComponent(em) +
+            '&cycleEveryMin=' + encodeURIComponent(ce) +
+            '&cycleOnMin=' + encodeURIComponent(co),
+          cache: 'no-store'
+        });
+
+        document.getElementById('cfgMsg').textContent =
+          r.ok ? 'Configuración guardada' : 'Error al guardar';
+
+        await loadConfig();
+        await updateWindowStatus();
+
+      } catch (err) {
+        document.getElementById('cfgMsg').textContent = String(err);
+      }
+    }
+
 
 
   </script>
@@ -707,7 +814,7 @@ function showConfig() {
     json += "\"active\":" + String(isWindowActive() ? "true" : "false") + ",";
     json += "\"diasMask\":" + String(diasMask) + ",";
     json += "\"start\":\"" + String(startHour) + ":" + (startMin < 10 ? "0" : "") + String(startMin) + "\",";
-    json += "\"durMin\":" + String(durWindowMin) + ",";
+    json += "\"end\":\"" + String(endHour) + ":" + (endMin < 10 ? "0" : "") + String(endMin) + "\","; 
     json += "\"time\":\"" + getLocalTimeString() + "\"";
     json += "}";
 
@@ -754,10 +861,10 @@ function showConfig() {
     json += "\"diasMask\":" + String(diasMask) + ",";
     json += "\"startHour\":" + String(startHour) + ",";
     json += "\"startMin\":" + String(startMin) + ",";
-    json += "\"durWindowMin\":" + String(durWindowMin) + ",";
+    json += "\"endHour\":" + String(endHour) + ",";
+    json += "\"endMin\":" + String(endMin) + ",";
     json += "\"cycleEveryMin\":" + String(cycleEveryMin) + ",";
-    json += "\"cycleOnMin\":" + String(cycleOnMin) + ",";
-    json += "\"sensorLimitEnable\":" + String(sensorLimitEnable ? "true" : "false");
+    json += "\"cycleOnMin\":" + String(cycleOnMin);
     json += "}";
 
     request->send(200, "application/json", json);
@@ -765,7 +872,8 @@ function showConfig() {
 
   server.on("/config/program", HTTP_POST, [](AsyncWebServerRequest *request) {
     // Requiere todo junto
-    const char* keys[] = {"progMode","diasMask","startHour","startMin","durWindowMin","cycleEveryMin","cycleOnMin"};
+    const char* keys[] = {"diasMask","startHour","startMin","endHour","endMin","cycleEveryMin","cycleOnMin"};
+
     for (auto k : keys) {
       if (!request->hasParam(k, true)) {
         request->send(400, "text/plain", String("Missing param: ") + k);
@@ -773,17 +881,16 @@ function showConfig() {
       }
     }
 
-    int pm = request->getParam("progMode", true)->value().toInt();
     int dm = request->getParam("diasMask", true)->value().toInt();
     int sh = request->getParam("startHour", true)->value().toInt();
     int sm = request->getParam("startMin", true)->value().toInt();
-    int du = request->getParam("durWindowMin", true)->value().toInt();
+    int eh = request->getParam("endHour", true)->value().toInt();
+    int em = request->getParam("endMin", true)->value().toInt();
+
     int ce = request->getParam("cycleEveryMin", true)->value().toInt();
     int co = request->getParam("cycleOnMin", true)->value().toInt();
 
     // Sanitizado (mismo criterio que venís usando)
-    if (pm < 0) pm = 0;
-    if (pm > 1) pm = 1;
 
     if (dm < 0) dm = 0;
     if (dm > 127) dm = 127;
@@ -794,22 +901,27 @@ function showConfig() {
     if (sm < 0) sm = 0;
     if (sm > 59) sm = 59;
 
-    if (du < 1) du = 1;
-    if (du > 1440) du = 1440;
+    if (eh < 0) eh = 0;
+    if (eh > 23) eh = 23;
+
+    if (em < 0) em = 0;
+    if (em > 59) em = 59;
 
     if (ce < 1) ce = 1;
     if (ce > 1440) ce = 1440;
 
     if (co < 1) co = 1;
     if (co > 1440) co = 1440;
-    if (co > ce) co = ce;
+    if (co >= ce) co = ce - 1;
+    if (co < 1) co = 1;
+
 
     // Aplicar
-    progMode = pm;
     diasMask = dm;
     startHour = sh;
-    startMin = sm;
-    durWindowMin = du;
+    startMin  = sm;
+    endHour   = eh;
+    endMin    = em;
     cycleEveryMin = ce;
     cycleOnMin = co;
 
@@ -993,9 +1105,7 @@ void applyStatusLeds() {
 }
 
 void onConfigChanged(bool stopPumpIfAuto) {
-  // Reset de estados internos para evitar “solapamientos”
-  cycleState = CYCLE_IDLE;
-  cycleStateMs = millis();
+
 
   // Si estamos en AUTO, lo más seguro es cortar inmediatamente
   // (si estás en MANUAL, respetamos manual salvo seguridad dura).
@@ -1058,10 +1168,6 @@ void enforceSafetyCutoff() {
     lastPumpChangeMs = millis();
   }
 
-  // Resetea ciclos para re-arrancar limpio cuando vuelva a ser seguro
-  cycleState = CYCLE_IDLE;
-  cycleStateMs = millis();
-
 }
 
 bool sensorWantsOn() {
@@ -1070,6 +1176,13 @@ bool sensorWantsOn() {
     return !(humedadPct > (umbralPct + H));   // mantiene ON hasta superar umbral+H
   } else {
     return (humedadPct < (umbralPct - H));    // enciende recién bajo umbral-H
+  }
+}
+
+void forceOffImmediate() {
+  if (regando) {
+    regando = false;
+    lastPumpChangeMs = millis();
   }
 }
 
@@ -1104,87 +1217,63 @@ void runProgSensor() {
 }
 
 void runProgCycles() {
-  
-  // Límite por sensor (opcional) en modo ciclos:
-  // si ya estamos por arriba del umbral + histéresis, NO regar y resetear ciclos.
-  if (sensorLimitEnable && (humedadPct >= (umbralPct + H))) {
-    applyAntiCycle(false);     // pedir OFF (respetando MIN_ON si estuviera ON)
-    cycleState = CYCLE_IDLE;   // re-arranca limpio cuando baje
-    cycleStateMs = millis();
-    return;
-  }
+  // En ciclos: SOLO seguridad dura (90%) actúa, lo demás es por timing.
+  // (enforceSafetyCutoff() ya se ejecuta antes)
 
-  // Programado + ciclos: IGNORA UMBRAL (salvo seguridad dura 90% que ya se chequea antes)
-  if (cycleOnMin >= cycleEveryMin) cycleOnMin = cycleEveryMin;
+  int elapsed = windowElapsedMin();
 
-  unsigned long now = millis();
+  // Validación: duración < intervalo
+  int every = cycleEveryMin;
+  int on    = cycleOnMin;
 
-  if (cycleState == CYCLE_IDLE) {
-    cycleState = CYCLE_ON;
-    cycleStateMs = now;
-  }
+  if (every < 1) every = 1;
+  if (every > 1440) every = 1440;
 
-  if (cycleState == CYCLE_ON) {
-    // Durante ON: queremos ON sí o sí (sin mirar sensor/umbral)
-    applyAntiCycle(true);
+  if (on < 1) on = 1;
+  if (on > 1440) on = 1440;
 
-    if (now - cycleStateMs >= (unsigned long)cycleOnMin * 60000UL) {
-      cycleState = CYCLE_OFF;
-      cycleStateMs = now;
-      applyAntiCycle(false);
-    }
-    return;
-  }
+  // Regla clave: debe ser menor que el intervalo (si no, no tiene sentido)
+  if (on >= every) on = every - 1;
+  if (on < 1) on = 1; // por si every era 1
 
-  // CYCLE_OFF
-  applyAntiCycle(false);
+  // Fase dentro del slot
+  int pos = elapsed % every;
 
-  unsigned long offMs = (unsigned long)(cycleEveryMin - cycleOnMin) * 60000UL;
-  if (offMs < 1000UL) offMs = 1000UL;
+  bool desired = (pos < on);
 
-  if (now - cycleStateMs >= offMs) {
-    cycleState = CYCLE_ON;
-    cycleStateMs = now;
-  }
+  // Para que corte/arranque “justo” a los límites del slot, conviene NO usar anti-ciclo aquí.
+  // Pero si querés mantenerlo por hardware (evitar relay chatter), lo dejamos configurable.
+  // Opción A (recomendado para exactitud de horario):
+  regando = desired;
+
+  // Si preferís respetar MIN_ON/MIN_OFF también en ciclos:
+  // applyAntiCycle(desired);
 }
+
 
 void sampleAndControl() {
   humedadPct = map(analogRead(PIN_HUMEDAD), 0, 4095, 0, 100);
 
-  // Seguridad dura: corta siempre (AUTO/MANUAL) y resetea ciclos
   enforceSafetyCutoff();
 
-  // Si estás en MANUAL, no hacemos control automático.
-  // (pero la seguridad ya pudo cortar la bomba arriba)
   if (modoManual) return;
 
-    // APAGADO: no se riega por nada (solo manual podría prender, pero manual ya salió arriba)
-  if (runMode == 2) {
-    if (regando) {
-      regando = false;
-      lastPumpChangeMs = millis();
-    }
-    cycleState = CYCLE_IDLE;
+  if (runMode == 2) {         // APAGADO
+    forceOffImmediate();
     return;
   }
 
-  // AUTO por sensor
-  if (runMode == 0) {
+  if (runMode == 0) {         // AUTO
     runAutoSensor();
     return;
   }
 
-    // PROGRAMADO: fuera de ventana => OFF + reset ciclos
+  // PROGRAMADO
   if (!isWindowActive()) {
-    cycleState = CYCLE_IDLE;
-    if (regando) {
-      regando = false;
-      lastPumpChangeMs = millis();
-    }
+    forceOffImmediate();
     return;
   }
 
-  // Dentro de ventana:
   if (progMode == 0) runProgSensor();
   else runProgCycles();
 }
