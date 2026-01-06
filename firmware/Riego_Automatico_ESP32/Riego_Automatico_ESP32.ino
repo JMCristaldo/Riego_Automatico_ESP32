@@ -109,7 +109,10 @@ void runProgCycles();
 void onConfigChanged(bool stopPumpIfAuto);
 void enterManual(bool savePrev);
 void exitManual(bool restorePrev);
-
+String getWindowStartString();
+String getWindowEndString();
+int getWifiRssi();
+String getWifiIpString();
 
 
 
@@ -215,6 +218,29 @@ void updateNtpStatus() {
     ntpOk = false;
   }
 }
+
+String getWindowStartString() {
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", startHour, startMin);
+  return String(buf);
+}
+
+String getWindowEndString() {
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", endHour, endMin);
+  return String(buf);
+}
+
+int getWifiRssi() {
+  if (WiFi.status() != WL_CONNECTED) return -999;
+  return WiFi.RSSI();
+}
+
+String getWifiIpString() {
+  if (WiFi.status() != WL_CONNECTED) return String("");
+  return WiFi.localIP().toString();
+}
+
 
 String getLocalTimeString() {
   if (!ntpOk) return String("--:--:--");
@@ -323,475 +349,750 @@ void setupServer() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Riego ESP32 - DEBUG</title>
+  <title>Riego ESP32</title>
   <style>
-    body { font-family: sans-serif; margin: 16px; }
-    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; max-width: 560px; }
-    .row { display: flex; justify-content: space-between; margin: 6px 0; }
-    pre { background:#f4f4f4; padding:10px; border-radius:10px; overflow:auto; }
-    .err { color:#b00020; }
-    code { background:#f4f4f4; padding:2px 6px; border-radius:6px; }
+    :root{
+      --bg:#0f1113;
+      --panel:#14171a;
+      --card:#171b1f;
+      --card2:#15191d;
+      --border:rgba(255,255,255,.06);
+      --text:#e7e7e7;
+      --muted:#9aa3ab;
+      --green:#35d07f;
+      --red:#ff4d4d;
+      --radius:16px;
+      --pad:14px;
+      --gap:12px;
+    }
+
+    *{ box-sizing:border-box; }
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background:var(--bg);
+      color:var(--text);
+      padding-bottom:70px; /* espacio para bottom bar */
+    }
+
+    /* Layout container */
+    .wrap{
+      max-width: 560px;
+      margin: 0 auto;
+      padding: 14px;
+    }
+
+    /* Top bar */
+    .topbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      padding: 12px 12px;
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02));
+      border:1px solid var(--border);
+      margin-bottom: 12px;
+    }
+    .title{
+      font-weight:600;
+      letter-spacing:.2px;
+    }
+    .topRight{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      color:var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .dot{
+      width:8px; height:8px; border-radius:50%;
+      background: rgba(255,255,255,.2);
+      display:inline-block;
+      margin-right:6px;
+    }
+    .wifiOk .dot{ background: var(--green); }
+    .wifiNo .dot{ background: var(--red); }
+
+    /* Grid */
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--gap);
+    }
+
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: var(--pad);
+    }
+
+    .square{
+      aspect-ratio: 1 / 1;
+      display:flex;
+      flex-direction:column;
+      justify-content:space-between;
+      min-height: 140px;
+    }
+
+    .wide{
+      grid-column: 1 / -1;
+    }
+
+    .label{
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing:.2px;
+    }
+
+    .valueRow{
+      display:flex;
+      align-items:baseline;
+      justify-content:space-between;
+      gap:10px;
+      margin-top: 6px;
+    }
+
+    .value{
+      font-size: 36px;
+      line-height: 1.0;
+      font-weight: 650;
+      letter-spacing: .2px;
+    }
+
+    .unit{
+      font-size: 14px;
+      color: var(--muted);
+      margin-left: 6px;
+    }
+
+    .sub{
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    /* Pill ON/OFF - estilo oscuro con texto de color */
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(0,0,0,.22);
+      border: 1px solid rgba(255,255,255,.08);
+      font-weight: 700;
+      letter-spacing: .6px;
+      font-size: 14px;
+      min-width: 86px;
+      user-select:none;
+    }
+    .pill.on{
+      color: var(--green);
+      border-color: rgba(53,208,127,.35);
+      box-shadow: 0 0 0 1px rgba(53,208,127,.05) inset;
+    }
+    .pill.off{
+      color: var(--red);
+      border-color: rgba(255,77,77,.35);
+      box-shadow: 0 0 0 1px rgba(255,77,77,.05) inset;
+    }
+
+    /* Manual button card */
+    .btnCard{
+      cursor:pointer;
+      user-select:none;
+      position:relative;
+      transition: transform .08s ease, box-shadow .12s ease;
+    }
+    .btnCard:active{
+      transform: translateY(1px);
+    }
+
+    /* “presionado” cuando está activo */
+    .btnCard.active{
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,.06) inset,
+        0 10px 30px rgba(0,0,0,.35) inset;
+    }
+
+    /* ranura LED */
+    .ledSlot{
+      position:absolute;
+      left: 14px;
+      right: 14px;
+      bottom: 14px;
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.08);
+      overflow:hidden;
+    }
+    .ledSlot::after{
+      content:"";
+      display:block;
+      height:100%;
+      width: 0%;
+      background: var(--green);
+      box-shadow: 0 0 18px rgba(53,208,127,.45);
+      transition: width .18s ease;
+    }
+    .btnCard.active .ledSlot::after{
+      width: 100%;
+    }
+
+    /* Select big */
+    select{
+      width:100%;
+      padding: 12px 12px;
+      border-radius: 12px;
+      background: rgba(0,0,0,.25);
+      border: 1px solid rgba(255,255,255,.10);
+      color: var(--text);
+      font-size: 16px;
+      outline:none;
+    }
+    select:disabled{
+      opacity:.55;
+    }
+
+    /* Slider */
+    input[type="range"]{
+      width:100%;
+      margin-top: 10px;
+      accent-color: var(--green);
+    }
+
+    /* Bottom bar */
+    #bottomBar{
+      position:fixed;
+      bottom:0; left:0; right:0;
+      background: rgba(10,12,14,.92);
+      border-top: 1px solid rgba(255,255,255,.06);
+      display:flex;
+      gap: 0;
+      padding: 8px 10px;
+      backdrop-filter: blur(6px);
+    }
+    #bottomBar button{
+      flex:1;
+      padding: 12px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.06);
+      background: rgba(255,255,255,.02);
+      color: var(--muted);
+      font-size: 14px;
+      transition: background .12s ease, color .12s ease, border-color .12s ease;
+    }
+    #bottomBar button.active{
+      background: rgba(53,208,127,.10);
+      border-color: rgba(53,208,127,.30);
+      color: var(--text);
+    }
+
+    /* Config view minimal dark */
+    .sectionTitle{
+      margin: 14px 0 8px;
+      font-size: 13px;
+      color: var(--muted);
+      letter-spacing:.3px;
+      text-transform: uppercase;
+    }
+    .row{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      margin: 10px 0;
+    }
     .btn{
       padding: 12px 14px;
-      margin: 4px 4px 0 0;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.04);
+      color: var(--text);
+    }
+    .small{
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .days{
+      display:flex; gap:10px; flex-wrap:wrap; margin: 8px 0;
+      color: var(--text);
+    }
+    input[type="number"], input[type="time"]{
+      background: rgba(0,0,0,.25);
+      border: 1px solid rgba(255,255,255,.10);
+      color: var(--text);
       border-radius: 10px;
+      padding: 10px 10px;
     }
-
-    #bottomBar {
-      position: fixed;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      display: flex;
-      background: #111;
-    }
-
-    #bottomBar button {
-      flex: 1;
-      padding: 14px;
-      border: none;
-      color: white;
-      background: #222;
-    }
-
-    body {
-      padding-bottom: 60px;
-    }
-
-
   </style>
 </head>
+
 <body>
+  <div class="wrap">
 
-<div id="dashboardView">
+    <!-- DASHBOARD -->
+    <div id="dashboardView">
 
-  <h2>Riego ESP32 - DEBUG</h2>
+      <div class="topbar">
+        <div class="title">Riego ESP32</div>
+        <div class="topRight">
+          <div id="wifiBadge" class="wifiNo"><span class="dot"></span><span id="wifiTxt">WiFi</span></div>
+          <div id="topTime">--</div>
+        </div>
+      </div>
 
-  <div class="card">
-    <div class="row"><div>Tick JS</div><div><code id="tick">0</code></div></div>
-    <div class="row"><div>HTTP</div><div><code id="http">--</code></div></div>
-    <div class="row"><div>Error</div><div><code id="err" class="err">--</code></div></div>
-    <div class="row"><div>Humedad</div><div><b id="hum">--</b>%</div></div>
-    <div class="row"><div>Umbral</div><div><b id="umb">--</b>%</div></div>
-    <div class="row"><div>Temp</div><div><b id="temp">--</b>°C</div></div>
-    <div class="row"><div>Hum. aire</div><div><b id="humAir">--</b>%</div></div> 
-    <div class="row"><div>Modo</div><div><b id="modo">--</b></div></div>
-    <div class="row"><div>Riego</div><div><b id="riego">--</b></div></div>
-    <div class="row"><div>Hora</div><div><code id="ts">--</code></div></div>
-  </div>
+      <div class="grid">
 
-  <h3>Umbral</h3>
-  <div class="card">
-    <div class="row">
-      <div>Umbral (%)</div>
-      <div><b id="umb2">--</b>%</div>
+        <!-- Fila 1 -->
+        <div class="card square">
+          <div class="label">HUMEDAD SUELO</div>
+          <div class="valueRow">
+            <div class="value"><span id="humVal">--</span><span class="unit">%</span></div>
+          </div>
+          <div class="sub">Sensor</div>
+        </div>
+
+        <div class="card square">
+          <div class="label">UMBRAL</div>
+          <div class="valueRow">
+            <div class="value"><span id="umbVal">--</span><span class="unit">%</span></div>
+          </div>
+          <div class="sub">Objetivo</div>
+        </div>
+
+        <!-- Fila 2 -->
+        <div class="card square">
+          <div class="label">HUM. AIRE</div>
+          <div class="valueRow">
+            <div class="value"><span id="humAirVal">--</span><span class="unit">%</span></div>
+          </div>
+          <div class="sub">DHT22</div>
+        </div>
+
+        <div class="card square">
+          <div class="label">TEMPERATURA</div>
+          <div class="valueRow">
+            <div class="value"><span id="tempVal">--</span><span class="unit">°C</span></div>
+          </div>
+          <div class="sub">DHT22</div>
+        </div>
+
+        <!-- Fila 3 -->
+        <div class="card wide">
+          <div class="label">AJUSTE DE UMBRAL</div>
+          <div class="valueRow" style="margin-top:8px;">
+            <div class="value" style="font-size:32px;"><span id="umbSliderVal">--</span><span class="unit">%</span></div>
+          </div>
+          <input id="umbSet" type="range" min="0" max="100" value="50">
+          <div class="small">Se guarda al soltar.</div>
+        </div>
+
+        <!-- Fila 4 -->
+        <div class="card wide">
+          <div class="label">MODO</div>
+          <div style="margin-top:10px;">
+            <select id="modeSelect" onchange="onModeChange(this.value)">
+              <option value="1">Automático</option>
+              <option value="2">Programado + Sensor</option>
+              <option value="4">Programado + Ciclos</option>
+              <option value="3">Apagado</option>
+            </select>
+          </div>
+          <div class="sub" id="modeHuman">—</div>
+        </div>
+
+        <!-- Fila 5 -->
+        <div class="card square">
+          <div class="label">RIEGO</div>
+          <div style="margin-top:12px;">
+            <span id="pumpPill" class="pill off">OFF</span>
+          </div>
+          <div class="sub" id="pumpSub">—</div>
+        </div>
+
+        <div class="card square btnCard" id="manualBtn" onclick="manualBtnClicked()">
+          <div class="label">MANUAL</div>
+          <div class="valueRow" style="margin-top:12px;">
+            <div class="value" style="font-size:28px;"><span id="manualTxt">OFF</span></div>
+          </div>
+          <div class="sub">Forzar bomba</div>
+          <div class="ledSlot"></div>
+        </div>
+
+      </div>
     </div>
 
-    <input id="umbSet" type="range" min="0" max="100" value="55" style="width:100%">
-  </div>
+    <!-- CONFIG -->
+    <div id="configView" style="display:none;">
 
+      <div class="topbar">
+        <div class="title">Configuración</div>
+        <div class="topRight">
+          <div id="cfgTime">--</div>
+        </div>
+      </div>
 
-  <h3>Modo</h3>
-  <div class="card">
+      <div class="sectionTitle">Programación (ventana)</div>
+      <div class="card">
 
-  <select id="modeSelect" onchange="onModeChange(this.value)">
-    <option value="1">Automático</option>
-    <option value="2">Programado + Sensor</option>
-    <option value="4">Programado + Ciclos</option>
-    <option value="3">Apagado</option>
-  </select>
+        <div class="row"><div class="label">NTP</div><div><b id="ntpOkTxt">--</b></div></div>
+        <div class="row"><div class="label">Hora ESP</div><div><span id="timeTxt">--:--:--</span></div></div>
+        <div class="row"><div class="label">Ventana activa</div><div><b id="winActiveTxt">--</b></div></div>
 
+        <hr style="border:0;border-top:1px solid rgba(255,255,255,.08); margin:14px 0;">
 
-    <div style="margin-top:8px;">
-      <code id="modeMsg">--</code>
+        <div class="label">Días de riego (inicio)</div>
+        <div class="days">
+          <label><input type="checkbox" class="day" data-bit="0"> Dom</label>
+          <label><input type="checkbox" class="day" data-bit="1"> Lun</label>
+          <label><input type="checkbox" class="day" data-bit="2"> Mar</label>
+          <label><input type="checkbox" class="day" data-bit="3"> Mié</label>
+          <label><input type="checkbox" class="day" data-bit="4"> Jue</label>
+          <label><input type="checkbox" class="day" data-bit="5"> Vie</label>
+          <label><input type="checkbox" class="day" data-bit="6"> Sáb</label>
+        </div>
+
+        <div class="row">
+          <div class="label">Inicio</div>
+          <div><input id="startTime" type="time" value="00:00"></div>
+        </div>
+
+        <div class="row">
+          <div class="label">Fin</div>
+          <div><input id="endTime" type="time" value="18:00"></div>
+        </div>
+
+        <div class="sectionTitle" style="margin-top:14px;">Ciclos</div>
+
+        <div class="row">
+          <div class="label">Intervalo (min)</div>
+          <div><input id="cycleEveryMin" type="number" min="1" max="1440" value="30" style="width:120px"></div>
+        </div>
+
+        <div class="row">
+          <div class="label">Duración riego (min)</div>
+          <div><input id="cycleOnMin" type="number" min="1" max="1440" value="2" style="width:120px"></div>
+        </div>
+
+        <div class="small">En “ciclos” se ignora el umbral. Seguridad dura: corta si humedad ≥ 90%.</div>
+
+        <div style="margin-top:14px;">
+          <button class="btn" onclick="saveConfig()">Guardar configuración</button>
+          <div class="small" id="cfgMsg" style="margin-top:8px;">—</div>
+        </div>
+
+      </div>
+
     </div>
-  </div>
-
-  <h3>Manual</h3>
-  <div class="card">
-    <label>
-      <input type="checkbox" id="manualSwitch" onchange="onManualToggle(this.checked)">
-      Riego manual (forzar ON)
-    </label>
-    <div style="margin-top:8px;">
-      <small>Al apagar vuelve al modo anterior automáticamente.</small>
-    </div>
-  </div>
-
-
-</div> <!-- dashboardView -->
-
-<div id="configView" style="display:none">
-  <h3>Programación (ventana)</h3>
-
-  <div class="card">
-    <div class="row"><div>NTP</div><div><b id="ntpOkTxt">--</b></div></div>
-    <div class="row"><div>Hora local</div><div><code id="timeTxt">--:--:--</code></div></div>
-    <div class="row"><div>Ventana activa</div><div><b id="winActiveTxt">--</b></div></div>
-
-    <hr>
-
-    <div><b>Días de riego (inicio)</b> <small>(0=Dom ... 6=Sab)</small></div>
-    <div style="display:flex; gap:10px; flex-wrap:wrap; margin:8px 0;">
-      <label><input type="checkbox" class="day" data-bit="0">Dom</label>
-      <label><input type="checkbox" class="day" data-bit="1">Lun</label>
-      <label><input type="checkbox" class="day" data-bit="2">Mar</label>
-      <label><input type="checkbox" class="day" data-bit="3">Mié</label>
-      <label><input type="checkbox" class="day" data-bit="4">Jue</label>
-      <label><input type="checkbox" class="day" data-bit="5">Vie</label>
-      <label><input type="checkbox" class="day" data-bit="6">Sáb</label>
-    </div>
-
-<h3>Ciclos</h3>
-<div class="card" id="cyclesCard">
-
-  <div class="row"><div>Intervalo (min)</div>
-    <div><input id="cycleEveryMin" type="number" min="1" max="1440" value="30" style="width:100px"></div>
-  </div>
-
-  <div class="row"><div>Duración riego (min)</div>
-    <div><input id="cycleOnMin" type="number" min="1" max="1440" value="2" style="width:100px"></div>
-  </div>
-
-
-  <small>Nota: en “ciclos” se ignora el umbral. Seguridad dura: corta si humedad ≥ 90%.</small>
-</div>
-
-  <div class="row">
-    <div>Inicio</div>
-    <div><input id="startTime" type="time" value="00:00"></div>
-  </div>
-
-  <div class="row">
-    <div>Fin</div>
-    <div><input id="endTime" type="time" value="18:00"></div>
-  </div>
-
-  <div style="margin-top:12px;">
-    <button class="btn" onclick="saveConfig()">
-      Guardar configuración
-    </button>
-    <div style="margin-top:6px;">
-      <small id="cfgMsg">—</small>
-    </div>
-  </div>
-
 
   </div>
-
-
-  <h3>RAW /status</h3>
-  <pre id="raw">(sin datos)</pre>
-
-</div> <!-- configView -->
-
-  <script>
-    let n = 0;
-    let draggingUmb = false;
-
-    window.addEventListener('load', () => {
-      const s = document.getElementById('umbSet');
-
-      // Mostrar el valor mientras se mueve el slider
-      s.addEventListener('input', () => {
-        document.getElementById('umb2').textContent = s.value;
-      });
-
-      // Detectar inicio de arrastre
-      s.addEventListener('pointerdown', () => {
-        draggingUmb = true;
-      });
-
-      // Al soltar: dejar de arrastrar y ENVIAR el valor al ESP32
-      s.addEventListener('pointerup', () => {
-        draggingUmb = false;
-        setUmbral();   
-      });
-
-      s.addEventListener('pointercancel', () => {
-        draggingUmb = false;
-      });
-    });
-
-    // Sincroniza UI con el valor real del ESP32
-    function syncUmbralUI(v) {
-      document.getElementById('umb2').textContent = v;
-      if (!draggingUmb) {
-        document.getElementById('umbSet').value = v;
-      }
-    }
-
-    async function updateWindowStatus() {
-      try {
-        const r = await fetch('/window/status?t=' + Date.now(), { cache: 'no-store' });
-        const w = await r.json();
-
-        document.getElementById('ntpOkTxt').textContent = w.ntpOk ? 'OK' : 'NO';
-        document.getElementById('timeTxt').textContent = w.time;
-        document.getElementById('winActiveTxt').textContent = w.active ? 'SI' : 'NO';
-        if (w.start && w.end) {
-          document.getElementById('winActiveTxt').textContent =
-            (w.active ? 'SI' : 'NO') + ` (${w.start} → ${w.end})`;
-        }
-
-      } catch (e) {
-        // no rompas toda la UI por esto
-      }
-    }
-
-    let manualActive = false;
-
-    async function update() {
-      n++;
-      document.getElementById('tick').textContent = n;
-
-      const url = '/status?t=' + Date.now(); // cache-buster real
-      
-      try {
-        const r = await fetch(url, { cache: 'no-store' });
-        document.getElementById('http').textContent = r.status + ' ' + r.statusText;
-
-        const txt = await r.text(); // primero texto para debug
-        document.getElementById('raw').textContent = txt;
-
-        const j = JSON.parse(txt);  // después parseo
-
-        manualActive = j.manual;
-
-        document.getElementById('manualSwitch').checked = manualActive;
-        document.getElementById('modeSelect').disabled = manualActive;
-
-        if (!manualActive) {
-          if (j.runMode === 0) modeSelect.value = 1;
-          else if (j.runMode === 2) modeSelect.value = 3;
-          else if (j.runMode === 1) {
-            modeSelect.value = (j.progMode === 1) ? 4 : 2;
-          }
-        }
-
-        
-        // DHT (por ahora puede venir null)
-        if (j.dhtOk && j.tempC != null) {
-          document.getElementById('temp').textContent = Number(j.tempC).toFixed(1);
-        } else {
-          document.getElementById('temp').textContent = '--';
-        }
-
-        if (j.dhtOk && j.humAir != null) {
-          document.getElementById('humAir').textContent = Number(j.humAir).toFixed(1);
-        } else {
-          document.getElementById('humAir').textContent = '--';
-        }
-
-        document.getElementById('hum').textContent = j.humedad;
-        document.getElementById('umb').textContent = j.umbral;
-        syncUmbralUI(j.umbral);
-        
-        let modoTxt = '';
-
-        if (j.modo === 'MANUAL') {
-          modoTxt = 'MANUAL';
-        } else {
-          // AUTO pero lo desglosamos por runMode + progMode
-          if (j.runMode === 0) {
-            modoTxt = 'AUTOMÁTICO';
-          } else if (j.runMode === 1) {
-            modoTxt = (j.progMode === 1) ? 'PROGRAMADO + CICLOS' : 'PROGRAMADO + SENSOR';
-          } else if (j.runMode === 2) {
-            modoTxt = 'APAGADO';
-          } else {
-            modoTxt = 'AUTO(?)';
-          }
-        }
-
-        document.getElementById('modo').textContent = modoTxt;
-
-
-        document.getElementById('riego').textContent = j.riego;
-
-        document.getElementById('ts').textContent = new Date().toLocaleTimeString();
-        document.getElementById('err').textContent = '--';
-      } catch (e) {
-        document.getElementById('err').textContent = String(e);
-      }
-      await updateWindowStatus();
-    }
-
-
-    async function setUmbral() {
-      const v = document.getElementById('umbSet').value;
-
-      try {
-        await fetch('/umbral/set', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'value=' + encodeURIComponent(v),
-          cache: 'no-store'
-        });
-
-        update();
-        // refresco inmediato
-      } catch (e) {
-        document.getElementById('err').textContent = String(e);
-      }
-    }
-
-
-    async function loadConfig() {
-      try {
-        const r = await fetch('/config/get?t=' + Date.now(), { cache: 'no-store' });
-        const cfg = await r.json();
-
-        // Días
-        document.querySelectorAll('input.day').forEach(cb => {
-          const bit = parseInt(cb.dataset.bit, 10);
-          cb.checked = ((cfg.diasMask >> bit) & 1) === 1;
-        });
-
-        // Hora inicio
-        const hh = String(cfg.startHour).padStart(2, '0');
-        const mm = String(cfg.startMin).padStart(2, '0');
-        document.getElementById('startTime').value = `${hh}:${mm}`;
-
-        // Hora fin
-        const eh = String(cfg.endHour).padStart(2, '0');
-        const em = String(cfg.endMin).padStart(2, '0');
-        document.getElementById('endTime').value = `${eh}:${em}`;
-
-
-        //Ciclos
-        document.getElementById('cycleEveryMin').value = cfg.cycleEveryMin;
-        document.getElementById('cycleOnMin').value = cfg.cycleOnMin;
-
-      } catch (e) {
-        document.getElementById('err').textContent = String(e);
-      }
-    }
-
-    function getDiasMaskFromUI() {
-      let mask = 0;
-      document.querySelectorAll('input.day').forEach(cb => {
-        const bit = parseInt(cb.dataset.bit, 10);
-        if (cb.checked) mask |= (1 << bit);
-      });
-      return mask;
-    }
-
-
-    async function setMainMode(v) {
-      try {
-        const r = await fetch('/mode/set', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'value=' + encodeURIComponent(v),
-          cache: 'no-store'
-        });
-        document.getElementById('modeMsg').textContent = r.status + ' ' + r.statusText;
-        await update();
-      } catch (e) {
-        document.getElementById('modeMsg').textContent = String(e);
-      }
-    }
-
-
-    window.addEventListener('load', () => {
-      loadConfig();
-      update();
-      setInterval(update, 1000);
-    });
-
-
-    function showDashboard() {
-      document.getElementById('dashboardView').style.display = 'block';
-      document.getElementById('configView').style.display = 'none';
-    }
-
-    async function showConfig() {
-      document.getElementById('dashboardView').style.display = 'none';
-      document.getElementById('configView').style.display = 'block';
-
-      await loadConfig();
-      await updateWindowStatus();
-    }
-
-    async function onModeChange(v) {
-      if (manualActive) return;
-      await setMainMode(v);
-    }
-
-    async function onManualToggle(on) {
-      await fetch('/manual/set', {
-        method: 'POST',
-        headers: {'Content-Type':'application/x-www-form-urlencoded'},
-        body: 'value=' + (on ? '1' : '0')
-      });
-    }
-
-    async function saveConfig() {
-      const mask = getDiasMaskFromUI();
-
-      // Inicio
-      const tStart = document.getElementById('startTime').value;
-      const s = tStart.split(':');
-      const sh = parseInt(s[0], 10);
-      const sm = parseInt(s[1], 10);
-
-      // Fin
-      const tEnd = document.getElementById('endTime').value;
-      const e = tEnd.split(':');
-      const eh = parseInt(e[0], 10);
-      const em = parseInt(e[1], 10);
-
-      // Ciclos
-      const ce = parseInt(document.getElementById('cycleEveryMin').value, 10);
-      const co = parseInt(document.getElementById('cycleOnMin').value, 10);
-
-      if (co >= ce) {
-        document.getElementById('cfgMsg').textContent =
-          'Error: la duración debe ser menor que el intervalo';
-        return;
-      }
-
-
-      try {
-        const r = await fetch('/config/program', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body:
-            'diasMask=' + encodeURIComponent(mask) +
-            '&startHour=' + encodeURIComponent(sh) +
-            '&startMin=' + encodeURIComponent(sm) +
-            '&endHour=' + encodeURIComponent(eh) +
-            '&endMin=' + encodeURIComponent(em) +
-            '&cycleEveryMin=' + encodeURIComponent(ce) +
-            '&cycleOnMin=' + encodeURIComponent(co),
-          cache: 'no-store'
-        });
-
-        document.getElementById('cfgMsg').textContent =
-          r.ok ? 'Configuración guardada' : 'Error al guardar';
-
-        await loadConfig();
-        await updateWindowStatus();
-
-      } catch (err) {
-        document.getElementById('cfgMsg').textContent = String(err);
-      }
-    }
-
-
-
-  </script>
 
   <div id="bottomBar">
-    <button onclick="showDashboard()">Dashboard</button>
-    <button onclick="showConfig()">Configuración</button>
+    <button id="navDash" class="active" onclick="showDashboard()">Dashboard</button>
+    <button id="navCfg" onclick="showConfig()">Configuración</button>
   </div>
 
+<script>
+  let draggingUmb = false;
+  let manualActive = false;
+
+  function setActiveTab(which){
+    const b1 = document.getElementById('navDash');
+    const b2 = document.getElementById('navCfg');
+    if(which === 'dash'){
+      b1.classList.add('active'); b2.classList.remove('active');
+    }else{
+      b2.classList.add('active'); b1.classList.remove('active');
+    }
+  }
+
+  function updateTopTime(){
+    const d = new Date();
+    // Ej: "sáb 13:20"
+    const day = d.toLocaleDateString(undefined, { weekday:'short' });
+    const time = d.toLocaleTimeString(undefined, { hour:'2-digit', minute:'2-digit' });
+    document.getElementById('topTime').textContent = `${day} ${time}`;
+    const cfgTime = document.getElementById('cfgTime');
+    if(cfgTime) cfgTime.textContent = `${day} ${time}`;
+  }
+
+  window.addEventListener('load', () => {
+    const s = document.getElementById('umbSet');
+
+    s.addEventListener('input', () => {
+      document.getElementById('umbSliderVal').textContent = s.value;
+    });
+
+    s.addEventListener('pointerdown', () => { draggingUmb = true; });
+    s.addEventListener('pointerup', () => { draggingUmb = false; setUmbral(); });
+    s.addEventListener('pointercancel', () => { draggingUmb = false; });
+
+    loadConfig();
+    update();
+    updateTopTime();
+    setInterval(update, 1000);
+    setInterval(updateTopTime, 1000);
+  });
+
+  function syncUmbralUI(v){
+    document.getElementById('umbSliderVal').textContent = v;
+    if(!draggingUmb){
+      document.getElementById('umbSet').value = v;
+    }
+  }
+
+  function modeToHuman(j){
+    if(j.manual) return "Manual (prioridad absoluta)";
+    if(j.runMode === 0) return "Automático: decide por humedad de suelo";
+    if(j.runMode === 2) return "Apagado: riego deshabilitado";
+    if(j.runMode === 1 && j.progMode === 0) return "Programado + Sensor: ventana + humedad";
+    if(j.runMode === 1 && j.progMode === 1) return "Programado + Ciclos: slots dentro de ventana";
+    return "—";
+  }
+
+  function applyPumpUI(isOn, safety){
+    const pill = document.getElementById('pumpPill');
+    const sub = document.getElementById('pumpSub');
+
+    if(isOn){
+      pill.textContent = "ON";
+      pill.classList.remove('off'); pill.classList.add('on');
+      sub.textContent = "Bomba activa";
+    }else{
+      pill.textContent = "OFF";
+      pill.classList.remove('on'); pill.classList.add('off');
+      sub.textContent = safety ? "Cortado por seguridad" : "Bomba detenida";
+    }
+  }
+
+  function applyManualUI(on){
+    const btn = document.getElementById('manualBtn');
+    const txt = document.getElementById('manualTxt');
+    if(on){
+      btn.classList.add('active');
+      txt.textContent = "ON";
+    }else{
+      btn.classList.remove('active');
+      txt.textContent = "OFF";
+    }
+  }
+
+  async function update(){
+    const url = '/status?t=' + Date.now();
+
+    try{
+      const r = await fetch(url, { cache:'no-store' });
+      const j = await r.json();
+
+      manualActive = !!j.manual;
+
+      // Top WiFi simple
+      const wifiBadge = document.getElementById('wifiBadge');
+      const wifiTxt = document.getElementById('wifiTxt');
+      if(j.wifiOk){
+        wifiBadge.classList.add('wifiOk');
+        wifiBadge.classList.remove('wifiNo');
+        wifiTxt.textContent = "WiFi OK";
+      }else{
+        wifiBadge.classList.remove('wifiOk');
+        wifiBadge.classList.add('wifiNo');
+        wifiTxt.textContent = "WiFi NO";
+      }
+
+      // Cards valores
+      document.getElementById('humVal').textContent = (j.humedad != null) ? j.humedad : "--";
+      document.getElementById('umbVal').textContent = (j.umbral != null) ? j.umbral : "--";
+      syncUmbralUI(j.umbral);
+
+      if(j.dhtOk && j.humAir != null) document.getElementById('humAirVal').textContent = Number(j.humAir).toFixed(1);
+      else document.getElementById('humAirVal').textContent = "--";
+
+      if(j.dhtOk && j.tempC != null) document.getElementById('tempVal').textContent = Number(j.tempC).toFixed(1);
+      else document.getElementById('tempVal').textContent = "--";
+
+      // Modo
+      const modeSelectEl = document.getElementById('modeSelect');
+      modeSelectEl.disabled = manualActive;
+
+      if(!manualActive){
+        if(j.runMode === 0) modeSelectEl.value = "1";
+        else if(j.runMode === 2) modeSelectEl.value = "3";
+        else if(j.runMode === 1) modeSelectEl.value = (j.progMode === 1) ? "4" : "2";
+      }
+      document.getElementById('modeHuman').textContent = modeToHuman(j);
+
+      // Riego + Manual
+      applyPumpUI(j.riego === "ON", !!j.safetyCutoff);
+      applyManualUI(manualActive);
+
+      // Config view status (si está visible, lo actualizamos también)
+      if(document.getElementById('configView').style.display !== 'none'){
+        document.getElementById('ntpOkTxt').textContent = j.ntpOk ? "OK" : "NO";
+        document.getElementById('timeTxt').textContent = j.espTime || "--:--:--";
+        document.getElementById('winActiveTxt').textContent =
+          (j.winActive ? "SI" : "NO") + (j.winStart ? ` (${j.winStart} → ${j.winEnd})` : "");
+      }
+
+    }catch(e){
+      // Si hay error de fetch, marcamos wifi como NO (no rompemos UI)
+      const wifiBadge = document.getElementById('wifiBadge');
+      const wifiTxt = document.getElementById('wifiTxt');
+      wifiBadge.classList.remove('wifiOk');
+      wifiBadge.classList.add('wifiNo');
+      wifiTxt.textContent = "WiFi ?";
+    }
+  }
+
+  async function setUmbral(){
+    const v = document.getElementById('umbSet').value;
+    try{
+      await fetch('/umbral/set', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+        body:'value=' + encodeURIComponent(v),
+        cache:'no-store'
+      });
+      await update();
+    }catch(e){}
+  }
+
+  async function setMainMode(v){
+    try{
+      await fetch('/mode/set', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+        body:'value=' + encodeURIComponent(v),
+        cache:'no-store'
+      });
+      await update();
+    }catch(e){}
+  }
+
+  async function onModeChange(v){
+    if(manualActive) return;
+    await setMainMode(v);
+  }
+
+  function manualBtnClicked(){
+    // Toggle manual desde la card (no cambia color, solo efecto presionado + led)
+    onManualToggle(!manualActive);
+  }
+
+  async function onManualToggle(on){
+    try{
+      await fetch('/manual/set', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+        body:'value=' + (on ? '1' : '0')
+      });
+      await update();
+    }catch(e){}
+  }
+
+  async function loadConfig(){
+    try{
+      const r = await fetch('/config/get?t=' + Date.now(), { cache:'no-store' });
+      const cfg = await r.json();
+
+      // Días
+      document.querySelectorAll('input.day').forEach(cb => {
+        const bit = parseInt(cb.dataset.bit, 10);
+        cb.checked = ((cfg.diasMask >> bit) & 1) === 1;
+      });
+
+      // Inicio
+      const hh = String(cfg.startHour).padStart(2,'0');
+      const mm = String(cfg.startMin).padStart(2,'0');
+      document.getElementById('startTime').value = `${hh}:${mm}`;
+
+      // Fin
+      const eh = String(cfg.endHour).padStart(2,'0');
+      const em = String(cfg.endMin).padStart(2,'0');
+      document.getElementById('endTime').value = `${eh}:${em}`;
+
+      // Ciclos
+      document.getElementById('cycleEveryMin').value = cfg.cycleEveryMin;
+      document.getElementById('cycleOnMin').value = cfg.cycleOnMin;
+
+    }catch(e){}
+  }
+
+  function getDiasMaskFromUI(){
+    let mask = 0;
+    document.querySelectorAll('input.day').forEach(cb => {
+      const bit = parseInt(cb.dataset.bit, 10);
+      if(cb.checked) mask |= (1 << bit);
+    });
+    return mask;
+  }
+
+  async function saveConfig(){
+    const mask = getDiasMaskFromUI();
+
+    const tStart = document.getElementById('startTime').value;
+    const s = tStart.split(':');
+    const sh = parseInt(s[0], 10);
+    const sm = parseInt(s[1], 10);
+
+    const tEnd = document.getElementById('endTime').value;
+    const e = tEnd.split(':');
+    const eh = parseInt(e[0], 10);
+    const em = parseInt(e[1], 10);
+
+    const ce = parseInt(document.getElementById('cycleEveryMin').value, 10);
+    const co = parseInt(document.getElementById('cycleOnMin').value, 10);
+
+    if(co >= ce){
+      document.getElementById('cfgMsg').textContent = 'Error: la duración debe ser menor que el intervalo';
+      return;
+    }
+
+    try{
+      const r = await fetch('/config/program', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+        body:
+          'diasMask=' + encodeURIComponent(mask) +
+          '&startHour=' + encodeURIComponent(sh) +
+          '&startMin=' + encodeURIComponent(sm) +
+          '&endHour=' + encodeURIComponent(eh) +
+          '&endMin=' + encodeURIComponent(em) +
+          '&cycleEveryMin=' + encodeURIComponent(ce) +
+          '&cycleOnMin=' + encodeURIComponent(co),
+        cache:'no-store'
+      });
+
+      document.getElementById('cfgMsg').textContent = r.ok ? 'Configuración guardada' : 'Error al guardar';
+      await loadConfig();
+      await update();
+    }catch(err){
+      document.getElementById('cfgMsg').textContent = String(err);
+    }
+  }
+
+  function showDashboard(){
+    document.getElementById('dashboardView').style.display = 'block';
+    document.getElementById('configView').style.display = 'none';
+    setActiveTab('dash');
+  }
+
+  async function showConfig(){
+    document.getElementById('dashboardView').style.display = 'none';
+    document.getElementById('configView').style.display = 'block';
+    setActiveTab('cfg');
+    await loadConfig();
+    await update();
+  }
+</script>
 
 </body>
 </html>
 )rawliteral";
+
 
   AsyncWebServerResponse *response = request->beginResponse(200, "text/html", html);
   response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
@@ -808,21 +1109,11 @@ void setupServer() {
   });
 
 
-  server.on("/window/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String json = "{";
-    json += "\"ntpOk\":" + String(ntpOk ? "true" : "false") + ",";
-    json += "\"active\":" + String(isWindowActive() ? "true" : "false") + ",";
-    json += "\"diasMask\":" + String(diasMask) + ",";
-    json += "\"start\":\"" + String(startHour) + ":" + (startMin < 10 ? "0" : "") + String(startMin) + "\",";
-    json += "\"end\":\"" + String(endHour) + ":" + (endMin < 10 ? "0" : "") + String(endMin) + "\","; 
-    json += "\"time\":\"" + getLocalTimeString() + "\"";
-    json += "}";
-
-    request->send(200, "application/json", json);
-  });
-
-
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    bool winActive = isWindowActive();
+    bool safety = safetyCutoffActive();
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);
+
     String json = "{";
     json += "\"humedad\":" + String(humedadPct) + ",";
     json += "\"umbral\":" + String(umbralPct) + ",";
@@ -836,11 +1127,26 @@ void setupServer() {
     json += "\"dhtOk\":" + String(dhtOk ? "true" : "false") + ",";
     if (dhtOk) {
       json += "\"tempC\":" + String(tempC, 1) + ",";
-      json += "\"humAir\":" + String(humAirPct, 1);
+      json += "\"humAir\":" + String(humAirPct, 1) + ",";
     } else {
       json += "\"tempC\":null,";
-      json += "\"humAir\":null";
+      json += "\"humAir\":null,";
     }
+
+    // --- NUEVO: NTP / ventana / seguridad ---
+    json += "\"ntpOk\":" + String(ntpOk ? "true" : "false") + ",";
+    json += "\"winActive\":" + String(winActive ? "true" : "false") + ",";
+    json += "\"winStart\":\"" + getWindowStartString() + "\",";
+    json += "\"winEnd\":\"" + getWindowEndString() + "\",";
+    json += "\"safetyCutoff\":" + String(safety ? "true" : "false") + ",";
+
+    // --- NUEVO: WiFi ---
+    json += "\"wifiOk\":" + String(wifiOk ? "true" : "false") + ",";
+    json += "\"ip\":\"" + getWifiIpString() + "\",";
+    json += "\"rssi\":" + String(getWifiRssi()) + ",";
+
+    // --- NUEVO: hora del ESP (si NTP ok) ---
+    json += "\"espTime\":\"" + getLocalTimeString() + "\"";
 
     json += "}";
 
@@ -853,6 +1159,7 @@ void setupServer() {
 
     request->send(response);
   });
+
 
 
   server.on("/config/get", HTTP_GET, [](AsyncWebServerRequest *request) {
