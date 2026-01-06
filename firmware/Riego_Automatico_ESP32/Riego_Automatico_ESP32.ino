@@ -5,6 +5,8 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
+#include <DHT.h>
+
 
 Preferences prefs;
 
@@ -15,7 +17,10 @@ Preferences prefs;
 #define PIN_LED_VERDE     25
 #define PIN_LED_AMARILLO  26
 #define PIN_LED_ROJO      27
-#define PIN_DHT           17  // reservado para DHT22 (DATA)
+#define PIN_DHT           17
+#define DHTTYPE           DHT22
+DHT dht(PIN_DHT, DHTTYPE);
+
 
 
 // ---------- Estado del sistema ----------
@@ -26,7 +31,10 @@ volatile bool regando = false;
 volatile int diasMask = 127;
 volatile int runMode = 0;
 
-// --- Futuro sensor ambiente (DHT22) ---
+// --- sensor ambiente (DHT22) ---
+
+unsigned long lastDhtMs = 0;
+const unsigned long DHT_PERIOD_MS = 2500;
 
 volatile float tempC = NAN;
 volatile float humAirPct = NAN;
@@ -113,6 +121,7 @@ String getWindowStartString();
 String getWindowEndString();
 int getWifiRssi();
 String getWifiIpString();
+void sampleDHT();
 
 
 
@@ -320,6 +329,26 @@ int windowElapsedMin() {
   if ((diasMask & (1 << yesterday)) == 0) return -1;
   if (nowMin >= endMinDay) return -1;  // por seguridad
   return (1440 - startMinDay) + nowMin;
+}
+
+void sampleDHT() {
+  unsigned long now = millis();
+  if (now - lastDhtMs < DHT_PERIOD_MS) return;
+  lastDhtMs = now;
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature(); // Celsius
+
+  if (isnan(h) || isnan(t)) {
+    dhtOk = false;
+    tempC = NAN;
+    humAirPct = NAN;
+    return;
+  }
+
+  dhtOk = true;
+  humAirPct = h;
+  tempC = t;
 }
 
 
@@ -839,11 +868,17 @@ void setupServer() {
   });
 
   function syncUmbralUI(v){
-    document.getElementById('umbSliderVal').textContent = v;
+    // Evita que "null/undefined" rompa el slider o muestre "null"
+    if (v == null) return;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return;
+
+    document.getElementById('umbSliderVal').textContent = n;
     if(!draggingUmb){
-      document.getElementById('umbSet').value = v;
+      document.getElementById('umbSet').value = n;
     }
   }
+
 
   function modeToHuman(j){
     if(j.manual) return "Manual (prioridad absoluta)";
@@ -906,7 +941,7 @@ void setupServer() {
       // Cards valores
       document.getElementById('humVal').textContent = (j.humedad != null) ? j.humedad : "--";
       document.getElementById('umbVal').textContent = (j.umbral != null) ? j.umbral : "--";
-      syncUmbralUI(j.umbral);
+      if (j.umbral != null) syncUmbralUI(j.umbral);
 
       if(j.dhtOk && j.humAir != null) document.getElementById('humAirVal').textContent = Number(j.humAir).toFixed(1);
       else document.getElementById('humAirVal').textContent = "--";
@@ -1354,6 +1389,8 @@ void setup() {
 
   pinMode(PIN_BTN, INPUT_PULLUP);
 
+    dht.begin();
+
   // I2C (pines estándar ESP32)
   Wire.begin(21, 22);
 
@@ -1562,6 +1599,12 @@ void sampleAndControl() {
   humedadPct = map(analogRead(PIN_HUMEDAD), 0, 4095, 0, 100);
 
   enforceSafetyCutoff();
+    // Si la seguridad dura está activa, NO dejes que ningún modo re-encienda la bomba
+  if (safetyCutoffActive()) {
+    forceOffImmediate();
+    return;
+  }
+
 
   if (modoManual) return;
 
@@ -1598,6 +1641,7 @@ void loop() {
 
   if (now - lastSampleMs >= SAMPLE_PERIOD_MS) {
     lastSampleMs = now;
+    sampleDHT();
     sampleAndControl();   // solo decide "regando"
     applyPumpOutput();    // SIEMPRE escribe GPIO18
     applyStatusLeds();    // LEDs de estado (GPIO25/26/27)
