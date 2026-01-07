@@ -10,6 +10,10 @@
 
 Preferences prefs;
 
+String wifiSsid;
+String wifiPass;
+
+
 #define PIN_LED_HEARTBEAT 2
 #define PIN_HUMEDAD       32
 #define PIN_BOMBA         18
@@ -30,6 +34,12 @@ volatile bool modoManual = false;
 volatile bool regando = false;
 volatile int diasMask = 127;
 volatile int runMode = 0;
+
+// --- WiFi Setup AP ---
+const char* AP_SSID = "RiegoESP32-Setup";
+const char* AP_PASS = "12345678";   // mínimo 8 chars (temporal)
+volatile bool wifiApMode = false;
+
 
 // ===================== HISTÓRICO EN RAM (ring buffer) =====================
 // Buffer dimensionado para 30 días @ 10 min => 4320 muestras
@@ -101,10 +111,6 @@ const unsigned long MIN_OFF_MS = 5000;
 unsigned long lastPumpChangeMs = 0;  // cuándo cambió regando por última vez
 
 
-// ---------- Servidor ----------
-const char* ssid = "WiFi_Fibertel_nnk_2.4GHz";
-const char* password = "cn6vxu7bjm";
-
 AsyncWebServer server(80);
 
 // ---------- Botón: debounce + edge ----------
@@ -170,7 +176,25 @@ String getWifiIpString();
 void sampleDHT();
 void historyAddSample();
 void historyTick();
+void loadWifiCredsFromNVS();
+bool hasWifiCreds();
+bool tryConnectSTAFromNVS(uint32_t timeoutMs);
+void startWifiAP();
 
+
+void startWifiAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.println("=== MODO CONFIGURACION WIFI ===");
+  Serial.print("AP SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("IP AP: ");
+  Serial.println(ip);
+
+  wifiApMode = true;
+}
 
 
 void historyAddSample() {
@@ -312,6 +336,33 @@ void updateNtpStatus() {
   }
 }
 
+
+void loadWifiCredsFromNVS() {
+  wifiSsid = prefs.getString("wifiSsid", "");
+  wifiPass = prefs.getString("wifiPass", "");
+  wifiSsid.trim();
+}
+
+bool hasWifiCreds() {
+  return wifiSsid.length() > 0;
+}
+
+bool tryConnectSTAFromNVS(uint32_t timeoutMs) {
+  loadWifiCredsFromNVS();
+  if (!hasWifiCreds()) return false;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
+    delay(250);
+  }
+  return (WiFi.status() == WL_CONNECTED);
+}
+
+
+
 String getWindowStartString() {
   char buf[6];
   snprintf(buf, sizeof(buf), "%02d:%02d", startHour, startMin);
@@ -346,6 +397,8 @@ String getLocalTimeString() {
   snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
   return String(buf);
 }
+
+
 
 bool isWindowActive() {
   if (!ntpOk) return false;
@@ -437,31 +490,112 @@ void sampleDHT() {
 
 
 void setupServer() {
-  Serial.println("[setupServer] Entrando...");
 
-  Serial.println("Conectando a WiFi...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  Serial.println("Conectando a WiFi (NVS)...");
+  bool ok = tryConnectSTAFromNVS(15000);
 
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(300);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
+  if (ok) {
     Serial.println("\nWiFi conectado");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
     initNTP();
     Serial.println("NTP iniciado.");
   } else {
-    Serial.println("\nWiFi NO conectado (timeout). El servidor igual arranca.");
+    Serial.println("\nWiFi NO conectado. Iniciando AP de configuración...");
+    startWifiAP();
   }
+
+  server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
+
+    const char* html = R"rawliteral(
+  <!doctype html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Configurar WiFi</title>
+    <style>
+      body{
+        font-family: system-ui, sans-serif;
+        background:#0f1113;
+        color:#e7e7e7;
+        padding:20px;
+      }
+      .card{
+        max-width:360px;
+        margin:auto;
+        background:#171b1f;
+        border-radius:16px;
+        padding:20px;
+      }
+      input,button{
+        width:100%;
+        padding:12px;
+        margin-top:10px;
+        border-radius:10px;
+        border:none;
+        font-size:16px;
+      }
+      input{
+        background:#0b0d0f;
+        color:#e7e7e7;
+      }
+      button{
+        background:#35d07f;
+        color:#000;
+        font-weight:600;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Configurar WiFi</h2>
+      <form method="POST" action="/wifi/save">
+        <input name="ssid" placeholder="Nombre de red (SSID)" required>
+        <input name="pass" type="password" placeholder="Contraseña">
+        <button type="submit">Guardar y conectar</button>
+      </form>
+    </div>
+  </body>
+  </html>
+  )rawliteral";
+
+    request->send(200, "text/html", html);
+  });
+
+  server.on("/wifi/save", HTTP_POST, [](AsyncWebServerRequest *request) {
+
+    if (!request->hasParam("ssid", true)) {
+      request->send(400, "text/plain", "SSID faltante");
+      return;
+    }
+
+    String ssid = request->getParam("ssid", true)->value();
+    String pass = "";
+    if (request->hasParam("pass", true)) {
+      pass = request->getParam("pass", true)->value();
+    }
+
+    ssid.trim();
+
+    prefs.putString("wifiSsid", ssid);
+    prefs.putString("wifiPass", pass);
+
+    request->send(200, "text/plain", "Credenciales guardadas. Reiniciando ESP32...");
+
+    wifiApMode = false;
+    delay(1200);
+    ESP.restart();
+  });
 
 
   // Ruta principal
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (wifiApMode) {
+      request->redirect("/wifi");
+      return;
+    }
+
   const char* html = R"rawliteral(
 <!doctype html>
 <html>
@@ -2044,25 +2178,6 @@ void sampleAndControl() {
 
 void loop() {
   
-  static bool lastWifiWasOk = false;
-  bool wifiOk = (WiFi.status() == WL_CONNECTED);
-  static unsigned long lastWifiTryMs = 0;
-
-
-  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiTryMs > 10000) {
-    lastWifiTryMs = millis();
-    WiFi.disconnect();
-    WiFi.begin(ssid, password);
-  }
-
-
-  if (wifiOk && !lastWifiWasOk) {
-    // Transición: volvió WiFi
-    initNTP();
-  }
-  lastWifiWasOk = wifiOk;
-
-
   heartbeat();
 
   handleButton();
