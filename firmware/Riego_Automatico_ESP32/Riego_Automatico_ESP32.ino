@@ -31,8 +31,34 @@ volatile bool regando = false;
 volatile int diasMask = 127;
 volatile int runMode = 0;
 
-// --- sensor ambiente (DHT22) ---
+// ===================== HISTÓRICO EN RAM (ring buffer) =====================
+// Buffer dimensionado para 30 días @ 10 min => 4320 muestras
+// En modo prueba podemos muestrear cada 1 min => cubre ~3 días.
 
+#define HISTORY_DAYS             30
+#define HISTORY_BASE_INTERVAL_S  (10 * 60)  // 10 minutos (diseño)
+#define HISTORY_CAPACITY         (HISTORY_DAYS * 24 * 60 / 10) // 4320
+
+// Para pruebas: ponelo en 60 (1 minuto). Para producción: 600 (10 min).
+// Si querés alternarlo rápido, dejalo en 60 mientras probás y luego volvés a 600.
+volatile uint32_t historyIntervalSec = 5;  // <-- Intervalo de muestreo del histórico (seg). En producción recomendado 600
+
+// Cada muestra es compacta (sin String, sin malloc)
+struct HistorySample {
+  uint32_t ts;      // epoch (si NTP ok) o uptime sec (si no)
+  uint8_t  soil;    // 0..100
+  int16_t  temp10;  // temp * 10 (ej 23.4°C => 234). INT16_MIN = inválido
+  uint16_t hum10;   // hum * 10 (ej 55.2% => 552). 0xFFFF = inválido
+  uint8_t  flags;   // bits: 0=regando, 1=dhtOk, 2=safety
+};
+
+HistorySample hist[HISTORY_CAPACITY];
+volatile uint16_t histHead = 0;   // próxima posición a escribir
+volatile uint16_t histCount = 0;  // cuántas válidas hay (<= CAPACITY)
+
+unsigned long lastHistorySampleMs = 0;
+
+// --- sensor ambiente (DHT22) ---
 unsigned long lastDhtMs = 0;
 const unsigned long DHT_PERIOD_MS = 2500;
 
@@ -94,6 +120,26 @@ unsigned long lastHbMs = 0;
 const unsigned long HB_PERIOD_MS = 500; // parpadeo cada 500ms
 bool hbState = false;
 
+static inline uint32_t getNowTsSec() {
+  if (ntpOk) {
+    return (uint32_t)time(nullptr);
+  }
+  return (uint32_t)(millis() / 1000);
+}
+
+static inline int16_t encodeTemp10(float tC) {
+  if (!isfinite(tC)) return INT16_MIN;
+  return (int16_t)lroundf(tC * 10.0f);
+}
+
+static inline uint16_t encodeHum10(float h) {
+  if (!isfinite(h)) return 0xFFFF;
+  int v = (int)lroundf(h * 10.0f);
+  if (v < 0) v = 0;
+  if (v > 1000) v = 1000; // 100.0%
+  return (uint16_t)v;
+}
+
 
 // ---- Prototipos de funciones ----
 void setupServer();
@@ -122,8 +168,46 @@ String getWindowEndString();
 int getWifiRssi();
 String getWifiIpString();
 void sampleDHT();
+void historyAddSample();
+void historyTick();
 
 
+
+void historyAddSample() {
+  HistorySample s;
+  s.ts = getNowTsSec();
+  s.soil = (uint8_t)constrain(humedadPct, 0, 100);
+
+  // DHT (si no está OK, guardamos inválido)
+  if (dhtOk) {
+    s.temp10 = encodeTemp10(tempC);
+    s.hum10  = encodeHum10(humAirPct);
+  } else {
+    s.temp10 = INT16_MIN;
+    s.hum10  = 0xFFFF;
+  }
+
+  uint8_t f = 0;
+  if (regando) f |= (1 << 0);
+  if (dhtOk)   f |= (1 << 1);
+  if (safetyCutoffActive()) f |= (1 << 2);
+  s.flags = f;
+
+  // write ring
+  hist[histHead] = s;
+  histHead = (histHead + 1) % HISTORY_CAPACITY;
+  if (histCount < HISTORY_CAPACITY) histCount++;
+}
+
+void historyTick() {
+  const unsigned long nowMs = millis();
+  const unsigned long periodMs = (unsigned long)historyIntervalSec * 1000UL;
+
+  if (nowMs - lastHistorySampleMs >= periodMs) {
+    lastHistorySampleMs = nowMs;
+    historyAddSample();
+  }
+}
 
 void loadConfigFromNVS() {
   // Si no existe la key, mantiene el default actual (segundo parámetro)
@@ -359,16 +443,22 @@ void setupServer() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
     delay(300);
     Serial.print(".");
   }
 
-  Serial.println("\nWiFi conectado");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-  initNTP();
-  Serial.println("NTP iniciado.");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi conectado");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    initNTP();
+    Serial.println("NTP iniciado.");
+  } else {
+    Serial.println("\nWiFi NO conectado (timeout). El servidor igual arranca.");
+  }
+
 
   // Ruta principal
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -459,11 +549,10 @@ void setupServer() {
     }
 
     .square{
-      aspect-ratio: 1 / 1;
       display:flex;
       flex-direction:column;
       justify-content:space-between;
-      min-height: 140px;
+      min-height: 100px;
     }
 
     .wide{
@@ -752,6 +841,29 @@ void setupServer() {
           <div class="ledSlot"></div>
         </div>
 
+        <!-- HISTÓRICO: SUELO -->
+        <div class="card wide">
+          <div class="label">HISTÓRICO — HUMEDAD SUELO (0–100%)</div>
+          <canvas id="soilCanvas" width="520" height="140" style="width:100%; height:140px; margin-top:10px;"></canvas>
+          <div class="small" id="soilInfo">—</div>
+        </div>
+
+        <!-- HISTÓRICO: HUMEDAD AIRE -->
+        <div class="card wide">
+          <div class="label">HISTÓRICO — HUMEDAD AIRE (0–100%)</div>
+          <canvas id="airHumCanvas" width="520" height="140" style="width:100%; height:140px; margin-top:10px;"></canvas>
+          <div class="small" id="airHumInfo">—</div>
+        </div>
+
+        <!-- HISTÓRICO: TEMPERATURA -->
+        <div class="card wide">
+          <div class="label">HISTÓRICO — TEMPERATURA (0–60°C)</div>
+          <canvas id="tempCanvas" width="520" height="140" style="width:100%; height:140px; margin-top:10px;"></canvas>
+          <div class="small" id="tempInfo">—</div>
+        </div>
+
+
+
       </div>
     </div>
 
@@ -865,6 +977,10 @@ void setupServer() {
     updateTopTime();
     setInterval(update, 1000);
     setInterval(updateTopTime, 1000);
+
+    fetchHistoryAndDraw();
+    setInterval(fetchHistoryAndDraw, 5000); // cada 5s
+
   });
 
   function syncUmbralUI(v){
@@ -1122,6 +1238,223 @@ void setupServer() {
     await loadConfig();
     await update();
   }
+
+  async function fetchHistoryAndDraw(){
+    try{
+      const r = await fetch('/history?last=360&t=' + Date.now(), { cache:'no-store' });
+      const h = await r.json();
+      const data = (h && h.data) ? h.data : [];
+
+      const hrs = Math.round((h.count * h.intervalSec) / 3600 * 10)/10;
+      const baseInfo = `${h.count} pts · ${h.intervalSec}s · ~${hrs} h · ` + (h.ntpOk ? 'NTP' : 'UPTIME');
+
+      // 1) Suelo
+      const soilCanvas = document.getElementById('soilCanvas');
+      if(soilCanvas) drawSoil(soilCanvas, data);
+      const soilInfo = document.getElementById('soilInfo');
+      if(soilInfo) soilInfo.textContent = baseInfo;
+
+      // 2) Humedad aire
+      const airHumCanvas = document.getElementById('airHumCanvas');
+      if(airHumCanvas) drawAirHum(airHumCanvas, data);
+      const airHumInfo = document.getElementById('airHumInfo');
+      if(airHumInfo) airHumInfo.textContent = baseInfo;
+
+      // 3) Temperatura
+      const tempCanvas = document.getElementById('tempCanvas');
+      if(tempCanvas) drawTemp(tempCanvas, data);
+      const tempInfo = document.getElementById('tempInfo');
+      if(tempInfo) tempInfo.textContent = baseInfo;
+
+    }catch(e){
+      const ids = ['soilInfo','airHumInfo','tempInfo'];
+      ids.forEach(id => {
+        const el = document.getElementById(id);
+        if(el) el.textContent = 'No se pudo leer /history';
+      });
+    }
+  }
+
+
+  function drawBase(ctx, W, H, yMin, yMax, yStep, unit){
+    const padL = 38;   // espacio para números del eje Y
+    const padR = 10;
+    const padT = 10;
+    const padB = 18;   // espacio para eje X
+
+    const plotX = padL;
+    const plotY = padT;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+
+    ctx.clearRect(0,0,W,H);
+
+    // ejes
+    ctx.strokeStyle = 'rgba(255,255,255,.18)';
+    ctx.lineWidth = 1;
+
+    // eje Y
+    ctx.beginPath();
+    ctx.moveTo(plotX, plotY);
+    ctx.lineTo(plotX, plotY + plotH);
+    ctx.stroke();
+
+    // eje X (abajo)
+    ctx.beginPath();
+    ctx.moveTo(plotX, plotY + plotH);
+    ctx.lineTo(plotX + plotW, plotY + plotH);
+    ctx.stroke();
+
+    // ticks eje Y + etiquetas
+    ctx.fillStyle = 'rgba(255,255,255,.55)';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+
+    ctx.strokeStyle = 'rgba(255,255,255,.18)';
+    for(let v=yMin; v<=yMax; v+=yStep){
+      const norm = (v - yMin) / (yMax - yMin); // 0..1
+      const y = plotY + plotH * (1 - norm);
+
+      // tick
+      ctx.beginPath();
+      ctx.moveTo(plotX - 4, y);
+      ctx.lineTo(plotX, y);
+      ctx.stroke();
+
+      // label
+      ctx.fillText(`${v}`, plotX - 6, y);
+    }
+
+    // unidad (arriba del eje Y)
+    if(unit){
+      ctx.fillStyle = 'rgba(255,255,255,.35)';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(unit, 2, 2);
+    }
+
+    return { plotX, plotY, plotW, plotH };
+  }
+
+
+  function drawSoil(canvas, data){
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+
+    if(!data || data.length < 2){
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(255,255,255,.75)';
+      ctx.font = '14px system-ui, sans-serif';
+      ctx.fillText('Esperando datos…', 12, 22);
+      return;
+    }
+
+    const yMin = 0, yMax = 100, yStep = 20;
+    const { plotX, plotY, plotW, plotH } = drawBase(ctx, W, H, yMin, yMax, yStep, '%');
+
+    const xAt = (i) => plotX + (plotW * i / (data.length-1));
+    const yAt = (v) => {
+      const norm = (v - yMin) / (yMax - yMin);
+      const clamped = Math.max(0, Math.min(1, norm));
+      return plotY + (plotH * (1 - clamped));
+    };
+
+    ctx.strokeStyle = 'rgba(53,208,127,.95)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for(let i=0;i<data.length;i++){
+      const soil = data[i][1];
+      const x = xAt(i);
+      const y = yAt(soil);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+
+
+  function drawAirHum(canvas, data){
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+
+    if(!data || data.length < 2){
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(255,255,255,.75)';
+      ctx.font = '14px system-ui, sans-serif';
+      ctx.fillText('Esperando datos…', 12, 22);
+      return;
+    }
+
+    const yMin = 0, yMax = 100, yStep = 20;
+    const { plotX, plotY, plotW, plotH } = drawBase(ctx, W, H, yMin, yMax, yStep, '%');
+
+    const xAt = (i) => plotX + (plotW * i / (data.length-1));
+    const yAt = (v) => {
+      const norm = (v - yMin) / (yMax - yMin);
+      const clamped = Math.max(0, Math.min(1, norm));
+      return plotY + (plotH * (1 - clamped));
+    };
+
+    ctx.strokeStyle = 'rgba(90,160,255,.85)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for(let i=0;i<data.length;i++){
+      const hum10 = data[i][3];
+      if(hum10 === 65535) continue;
+      const hum = hum10/10;
+
+      const x = xAt(i);
+      const y = yAt(hum);
+      if(!started){ ctx.moveTo(x,y); started=true; }
+      else ctx.lineTo(x,y);
+    }
+    if(started) ctx.stroke();
+  }
+
+
+  function drawTemp(canvas, data){
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+
+    if(!data || data.length < 2){
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(255,255,255,.75)';
+      ctx.font = '14px system-ui, sans-serif';
+      ctx.fillText('Esperando datos…', 12, 22);
+      return;
+    }
+
+    const yMin = 0, yMax = 60, yStep = 15;
+    const { plotX, plotY, plotW, plotH } = drawBase(ctx, W, H, yMin, yMax, yStep, '°C');
+
+    const xAt = (i) => plotX + (plotW * i / (data.length-1));
+    const yAt = (v) => {
+      const norm = (v - yMin) / (yMax - yMin);
+      const clamped = Math.max(0, Math.min(1, norm));
+      return plotY + (plotH * (1 - clamped));
+    };
+
+    ctx.strokeStyle = 'rgba(255,170,60,.90)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for(let i=0;i<data.length;i++){
+      const t10 = data[i][2];
+      if(t10 === -32768) continue;
+      const t = t10/10;
+
+      const x = xAt(i);
+      const y = yAt(t);
+      if(!started){ ctx.moveTo(x,y); started=true; }
+      else ctx.lineTo(x,y);
+    }
+    if(started) ctx.stroke();
+  }
+
+
+
+
 </script>
 
 </body>
@@ -1149,68 +1482,159 @@ void setupServer() {
     bool safety = safetyCutoffActive();
     bool wifiOk = (WiFi.status() == WL_CONNECTED);
 
-    String json = "{";
-    json += "\"humedad\":" + String(humedadPct) + ",";
-    json += "\"umbral\":" + String(umbralPct) + ",";
-    json += "\"progMode\":" + String(progMode) + ",";
-    json += "\"modo\":\"" + String(modoManual ? "MANUAL" : "AUTO") + "\",";
-    json += "\"manual\":" + String(modoManual ? "true" : "false") + ",";
-    json += "\"runMode\":" + String(runMode) + ",";
-    json += "\"riego\":\"" + String(regando ? "ON" : "OFF") + "\",";
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    response->addHeader("Pragma", "no-cache");
+    response->addHeader("Expires", "0");
 
-    // --- DHT (placeholder por ahora) ---
-    json += "\"dhtOk\":" + String(dhtOk ? "true" : "false") + ",";
-    if (dhtOk) {
-      json += "\"tempC\":" + String(tempC, 1) + ",";
-      json += "\"humAir\":" + String(humAirPct, 1) + ",";
+    char tbuf[16];   // para temp/hum con 1 decimal
+    char ipbuf[20];  // "255.255.255.255"
+    char stbuf[6];
+    char enbuf[6];
+    char timebuf[12];
+
+    // Window strings (sin Strings intermedias)
+    snprintf(stbuf, sizeof(stbuf), "%02d:%02d", startHour, startMin);
+    snprintf(enbuf, sizeof(enbuf), "%02d:%02d", endHour, endMin);
+
+    // IP
+    if (wifiOk) {
+      IPAddress ip = WiFi.localIP();
+      snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
     } else {
-      json += "\"tempC\":null,";
-      json += "\"humAir\":null,";
+      ipbuf[0] = '\0';
     }
 
-    // --- NUEVO: NTP / ventana / seguridad ---
-    json += "\"ntpOk\":" + String(ntpOk ? "true" : "false") + ",";
-    json += "\"winActive\":" + String(winActive ? "true" : "false") + ",";
-    json += "\"winStart\":\"" + getWindowStartString() + "\",";
-    json += "\"winEnd\":\"" + getWindowEndString() + "\",";
-    json += "\"safetyCutoff\":" + String(safety ? "true" : "false") + ",";
+    // Hora
+    if (ntpOk) {
+      time_t now = time(nullptr);
+      struct tm t;
+      localtime_r(&now, &t);
+      snprintf(timebuf, sizeof(timebuf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+    } else {
+      snprintf(timebuf, sizeof(timebuf), "--:--:--");
+    }
 
-    // --- NUEVO: WiFi ---
-    json += "\"wifiOk\":" + String(wifiOk ? "true" : "false") + ",";
-    json += "\"ip\":\"" + getWifiIpString() + "\",";
-    json += "\"rssi\":" + String(getWifiRssi()) + ",";
+    response->print("{");
 
-    // --- NUEVO: hora del ESP (si NTP ok) ---
-    json += "\"espTime\":\"" + getLocalTimeString() + "\"";
+    response->print("\"humedad\":"); response->print(humedadPct); response->print(",");
+    response->print("\"umbral\":");  response->print(umbralPct);  response->print(",");
+    response->print("\"progMode\":");response->print(progMode);   response->print(",");
+    response->print("\"modo\":\"");  response->print(modoManual ? "MANUAL" : "AUTO"); response->print("\",");
+    response->print("\"manual\":");  response->print(modoManual ? "true" : "false"); response->print(",");
+    response->print("\"runMode\":"); response->print(runMode); response->print(",");
+    response->print("\"riego\":\""); response->print(regando ? "ON" : "OFF"); response->print("\",");
 
-    json += "}";
+    response->print("\"dhtOk\":"); response->print(dhtOk ? "true" : "false"); response->print(",");
+    if (dhtOk) {
+      // temp/hum 1 decimal sin String()
+      dtostrf(tempC, 0, 1, tbuf);
+      response->print("\"tempC\":"); response->print(tbuf); response->print(",");
 
-    AsyncWebServerResponse *response =
-      request->beginResponse(200, "application/json", json);
+      dtostrf(humAirPct, 0, 1, tbuf);
+      response->print("\"humAir\":"); response->print(tbuf); response->print(",");
+    } else {
+      response->print("\"tempC\":null,");
+      response->print("\"humAir\":null,");
+    }
+
+    response->print("\"ntpOk\":"); response->print(ntpOk ? "true" : "false"); response->print(",");
+    response->print("\"winActive\":"); response->print(winActive ? "true" : "false"); response->print(",");
+    response->print("\"winStart\":\""); response->print(stbuf); response->print("\",");
+    response->print("\"winEnd\":\"");   response->print(enbuf); response->print("\",");
+    response->print("\"safetyCutoff\":"); response->print(safety ? "true" : "false"); response->print(",");
+
+    response->print("\"wifiOk\":"); response->print(wifiOk ? "true" : "false"); response->print(",");
+    response->print("\"ip\":\""); response->print(ipbuf); response->print("\",");
+    response->print("\"rssi\":"); response->print(getWifiRssi()); response->print(",");
+    response->print("\"espTime\":\""); response->print(timebuf); response->print("\"");
+
+    response->print("}");
+    request->send(response);
+  });
+
+
+
+  server.on("/history", HTTP_GET, [](AsyncWebServerRequest *request) {
+
+    // /history?last=360  -> últimas N muestras (opcional)
+    int last = -1;
+    if (request->hasParam("last")) {
+      last = request->getParam("last")->value().toInt();
+    }
+
+    // Snapshot consistente del ring buffer
+    uint16_t head = histHead;        // volatile -> copia local
+    uint16_t available = histCount; // volatile -> copia local
+
+    uint16_t count = available;
+    if (last > 0 && last < count) {
+      count = (uint16_t)last;
+    }
+
+
+    AsyncResponseStream *response =
+      request->beginResponseStream("application/json");
 
     response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     response->addHeader("Pragma", "no-cache");
     response->addHeader("Expires", "0");
+
+    // --- Header JSON ---
+    response->print("{");
+    response->print("\"capacity\":"); response->print(HISTORY_CAPACITY); response->print(",");
+    response->print("\"count\":"); response->print(count); response->print(",");
+    response->print("\"intervalSec\":"); response->print(historyIntervalSec); response->print(",");
+    response->print("\"ntpOk\":"); response->print(ntpOk ? "true" : "false"); response->print(",");
+    response->print("\"data\":[");
+
+    // Índice inicial (orden temporal ascendente)
+    int startIndex = (int)head - (int)count;
+    while (startIndex < 0) startIndex += HISTORY_CAPACITY;
+
+
+    for (uint16_t i = 0; i < count; i++) {
+      uint16_t idx = (startIndex + i) % HISTORY_CAPACITY;
+      const HistorySample &s = hist[idx];
+
+      response->print("[");
+      response->print(s.ts);    response->print(",");
+      response->print(s.soil);  response->print(",");
+      response->print(s.temp10);response->print(",");
+      response->print(s.hum10); response->print(",");
+      response->print(s.flags);
+      response->print("]");
+
+      if (i + 1 < count) response->print(",");
+    }
+
+    response->print("]}");
 
     request->send(response);
   });
 
 
 
-  server.on("/config/get", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String json = "{";
-    json += "\"progMode\":" + String(progMode) + ",";
-    json += "\"diasMask\":" + String(diasMask) + ",";
-    json += "\"startHour\":" + String(startHour) + ",";
-    json += "\"startMin\":" + String(startMin) + ",";
-    json += "\"endHour\":" + String(endHour) + ",";
-    json += "\"endMin\":" + String(endMin) + ",";
-    json += "\"cycleEveryMin\":" + String(cycleEveryMin) + ",";
-    json += "\"cycleOnMin\":" + String(cycleOnMin);
-    json += "}";
+server.on("/config/get", HTTP_GET, [](AsyncWebServerRequest *request) {
+  AsyncResponseStream *response = request->beginResponseStream("application/json");
+  response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  response->addHeader("Pragma", "no-cache");
+  response->addHeader("Expires", "0");
 
-    request->send(200, "application/json", json);
-  });
+  response->print("{");
+  response->print("\"progMode\":"); response->print(progMode); response->print(",");
+  response->print("\"diasMask\":"); response->print(diasMask); response->print(",");
+  response->print("\"startHour\":"); response->print(startHour); response->print(",");
+  response->print("\"startMin\":"); response->print(startMin); response->print(",");
+  response->print("\"endHour\":"); response->print(endHour); response->print(",");
+  response->print("\"endMin\":"); response->print(endMin); response->print(",");
+  response->print("\"cycleEveryMin\":"); response->print(cycleEveryMin); response->print(",");
+  response->print("\"cycleOnMin\":"); response->print(cycleOnMin);
+  response->print("}");
+
+  request->send(response);
+});
+
 
   server.on("/config/program", HTTP_POST, [](AsyncWebServerRequest *request) {
     // Requiere todo junto
@@ -1218,7 +1642,8 @@ void setupServer() {
 
     for (auto k : keys) {
       if (!request->hasParam(k, true)) {
-        request->send(400, "text/plain", String("Missing param: ") + k);
+        request->send(400, "text/plain", "Missing param");
+
         return;
       }
     }
@@ -1395,6 +1820,7 @@ void setup() {
   Wire.begin(21, 22);
 
   delay(2000);     // tiempo para abrir Serial Monitor
+  lastHistorySampleMs = millis(); // arranca el conteo del histórico desde el inicio
   setupServer();
 }
 
@@ -1561,8 +1987,7 @@ void runProgSensor() {
 }
 
 void runProgCycles() {
-  // En ciclos: SOLO seguridad dura (90%) actúa, lo demás es por timing.
-  // (enforceSafetyCutoff() ya se ejecuta antes)
+  // En ciclos no se usa umbral. Solo seguridad dura
 
   int elapsed = windowElapsedMin();
 
@@ -1598,38 +2023,45 @@ void runProgCycles() {
 void sampleAndControl() {
   humedadPct = map(analogRead(PIN_HUMEDAD), 0, 4095, 0, 100);
 
-  enforceSafetyCutoff();
-    // Si la seguridad dura está activa, NO dejes que ningún modo re-encienda la bomba
-  if (safetyCutoffActive()) {
+  // Seguridad dura: si >=90% siempre OFF y salir
+  if (humedadPct >= 90) {
     forceOffImmediate();
     return;
   }
-
 
   if (modoManual) return;
 
-  if (runMode == 2) {         // APAGADO
-    forceOffImmediate();
-    return;
-  }
+  if (runMode == 2) { forceOffImmediate(); return; }
+  if (runMode == 0) { runAutoSensor(); return; }
 
-  if (runMode == 0) {         // AUTO
-    runAutoSensor();
-    return;
-  }
-
-  // PROGRAMADO
-  if (!isWindowActive()) {
-    forceOffImmediate();
-    return;
-  }
+  if (!isWindowActive()) { forceOffImmediate(); return; }
 
   if (progMode == 0) runProgSensor();
   else runProgCycles();
+
 }
 
 
 void loop() {
+  
+  static bool lastWifiWasOk = false;
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  static unsigned long lastWifiTryMs = 0;
+
+
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiTryMs > 10000) {
+    lastWifiTryMs = millis();
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
+
+
+  if (wifiOk && !lastWifiWasOk) {
+    // Transición: volvió WiFi
+    initNTP();
+  }
+  lastWifiWasOk = wifiOk;
+
 
   heartbeat();
 
@@ -1646,4 +2078,8 @@ void loop() {
     applyPumpOutput();    // SIEMPRE escribe GPIO18
     applyStatusLeds();    // LEDs de estado (GPIO25/26/27)
   }
+
+  // Histórico independiente del control (cada X segundos)
+  historyTick();
+
 }
